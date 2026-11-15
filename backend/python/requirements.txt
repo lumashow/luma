@@ -4,5 +4,9 @@ librosa>=0.10.0
 soundfile>=0.12.0
 numpy>=1.24.0
 matplotlib>=3.8.0
+# The app installs wheels only. demucs 4.0.1 ships none, but it is pure
+# Python, so building it needs no compiler. Drop this line with a demucs
+# that ships a wheel.
+--no-binary demucs
 demucs==4.0.1
 torchcodec>=0.0.4
