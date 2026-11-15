@@ -134,3 +134,30 @@ jobs:
         run: python -m unittest discover -s backend/python/tests
       - name: Test the release scripts
         run: python -m unittest discover -s scripts/release
+
+  # The app installs each requirements file on its own, torch pins stripped,
+  # from wheels only (`install_requirements` and `pip_install` in
+  # backend/src/runtime/python.rs). Resolving them the same way on each
+  # platform we ship makes a dependency without a wheel fail here, not on
+  # someone's machine.
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve every requirements file from wheels
+        run: |
+          for file in backend/python/requirements.txt backend/python/*/requirements.txt; do
+            echo "::group::$file"
+            grep -viE '^\s*(torch|torchaudio|torchvision)==' "$file" > "$RUNNER_TEMP/requirements.txt"
+            python -m pip install --dry-run --quiet --disable-pip-version-check --only-binary :all: -r "$RUNNER_TEMP/requirements.txt"
+            echo "::endgroup::"
+          done
