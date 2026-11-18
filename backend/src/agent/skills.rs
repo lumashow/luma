@@ -577,7 +577,8 @@ mod tests {
         assert!(registry.get("effect-catalog").is_some());
         assert!(registry.get("reading-music-into-light").is_some());
         assert!(registry.get("lasers").is_some());
-        assert_eq!(registry.iter().count(), 15);
+        assert!(registry.get("port-score").is_some());
+        assert_eq!(registry.iter().count(), 16);
         assert!(registry.listing().contains("<available_skills>"));
         assert!(
             !registry.listing().contains("SKILL.md")

@@ -1,17 +1,20 @@
 """luma.scores: your other scores, to read.
 
-`find` lists them and `open` reads one. A reference is read-only: it shows
-what a show did and on which lights, so it can be learned from or adapted to
-the rig that is open. Nothing here changes a score.
+`find` lists them and `open` reads one. A reference is read-only: it reads
+like `luma.track`, on its own track's bars, and carries its own `venue`, so
+every render and filmstrip of a reference shows its rig, not the open one.
+Nothing here changes a score.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from collections import OrderedDict
 
-from .score import BarGrid, Clip, _plain
+from .bindings import LumaRecord
+from .score import Clip, GraphTrack
+from .track import TrackReadOnlyError
+from .venue import Venue
 
 _OUTPUTS = ("color", "aim", "strobe", "laser")
 # A clip placed once per hit is named for its look plus where it sits:
@@ -36,13 +39,21 @@ def _output(graph):
 
 
 class Found(tuple):
-    """What `find` returned. Index it, and pass an item to `open`."""
+    """What `find` returned. Index it, and pass an item to `open`. `more`
+    says the list was cut."""
+
+    def __new__(cls, rows, more=False):
+        found = super().__new__(cls, rows)
+        found.more = bool(more)
+        return found
 
     def __repr__(self):
         if not self:
             return "no other scores of yours match"
         lines = [f"{len(self)} score{'' if len(self) == 1 else 's'}"]
         lines += [f"  [{index}] {item}" for index, item in enumerate(self)]
+        if self.more:
+            lines.append("  more match: narrow the search or raise limit")
         lines.append("open one with luma.scores.open(found[0])")
         return "\n".join(lines)
 
@@ -50,82 +61,65 @@ class Found(tuple):
 class FoundScore:
     """One score in a `find` result."""
 
-    __slots__ = ("id", "name", "track_id", "track", "artist", "venue", "clips", "edited")
+    __slots__ = ("id", "name", "track_id", "track", "artist", "venue_id", "venue", "clips", "edited")
 
     def __init__(self, row):
         self.id = row["id"]
         self.name = row.get("name") or ""
         self.track_id = row["track_id"]
-        self.track = row.get("track_title") or ""
-        self.artist = row.get("track_artist") or ""
+        self.track = row.get("title") or ""
+        self.artist = row.get("artist") or ""
+        self.venue_id = row.get("venue_id") or ""
         self.venue = row.get("venue_name") or ""
         self.clips = int(row.get("clips") or 0)
-        self.edited = str(row.get("updated_at") or "")[:10]
+        self.edited = str(row.get("edited_at") or "")[:10]
 
     def __repr__(self):
         title = f"{self.track} — {self.artist}" if self.artist else self.track
         name = f' · "{self.name}"' if self.name else ""
-        return f"{title} @ {self.venue}{name} · {self.clips} clips · edited {self.edited}"
+        return f"{title} @ {self.venue}{name} · {self.clips} clips · edited {self.edited or 'never'}"
 
 
-class ReferenceVenue:
-    """The rig a reference score plays on: its name and what each group is."""
-
-    __slots__ = ("id", "name", "_groups")
-
-    def __init__(self, values):
-        self.id = values["id"]
-        self.name = values.get("name") or ""
-        self._groups = tuple(values.get("groups") or ())
-
-    def groups(self):
-        """Each group: name, fixtures, cells (0 for whole fixtures) and models."""
-        return tuple(dict(group) for group in self._groups)
-
-    def describe(self):
-        lines = [f"{self.name}: {len(self._groups)} groups"]
-        for group in self._groups:
-            part = f"{group['cells']} cells of " if group["cells"] else ""
-            models = ", ".join(group["models"]) or "nothing"
-            lines.append(f"  {group['name']}: {part}{group['fixtures']} fixtures ({models})")
-        return "\n".join(lines)
-
-    def __repr__(self):
-        return f"<venue {self.name!r} of a reference score; describe(), groups()>"
-
-
-class Reference:
-    """One of your other scores, read-only.
+class Reference(GraphTrack):
+    """One of your other scores, read-only, with the venue it was written for.
 
     `looks()` is the place to start: each distinct look, how often it plays,
     on which groups and where first. `roles()` turns that round: what each
-    group of that rig is made of and which looks it carries. `clips` are
-    ordinary Clip values, so `clip.graph` goes straight into
-    `edit.add_clip(clip.graph, name=clip.name, at=clip.at, selection=...)`
-    on the open track; `clip.graph.source()` prints its Python. Positions are
-    this track's when the reference is the same song (`same_track`);
-    otherwise they count four beats to a bar from the song's first downbeat.
+    group of that rig is made of and which looks it carries. Beyond those it
+    reads as `luma.track` does: `clips`, each clip's `graph` and
+    `graph.source()`, `window(...)` with `timeline()`, `output.heatmap()` and
+    `filmstrip()`, and `review()`. A clip's graph goes straight into
+    `edit.add_clip(clip.graph, name=clip.name, at=clip.at, selection=...)` on
+    the open track. Positions are on this score's own track's bars, which are
+    the open track's when it is the same song (`same_track`). `venue` is its
+    own room: `describe()`, `groups()`, `fixtures` and `render(t=...)`, which
+    shows this score on that rig.
     """
 
-    def __init__(self, values, bars):
-        self.id = values["id"]
-        self.name = values.get("name") or ""
-        self.track = values.get("track_title") or ""
-        self.same_track = bool(values.get("same_track"))
-        self.venue = ReferenceVenue(values["venue"])
-        self._document = _plain(values["document"])
-        self._bars = bars
+    def __init__(self, opened, track, figures):
+        score_id = str(opened["id"])
+
+        def read(method, payload=None):
+            return track._call("track.scores_read",
+                               {"score": score_id, "method": method, "payload": payload})
+
+        super().__init__(opened["track"], nodes=track._nodes, features=opened["features"],
+                         host_call=read, artifact_store=track._artifact_store)
+        rig = opened["venue"]
+        venue = Venue(LumaRecord({key: rig[key] for key in ("id", "name", "views")}, "reference.venue"),
+                      host_call=read, figures=figures, workspace=track._artifact_store.workspace)
+        for name, value in (("score_id", score_id), ("name", str(opened.get("name") or "")),
+                            ("same_track", bool(opened.get("same_track"))), ("venue", venue),
+                            ("_rig", tuple(rig.get("groups") or ()))):
+            object.__setattr__(self, name, value)
 
     @property
-    def clips(self):
-        """Every clip, ordered by start, layer z, then id."""
-        return tuple(Clip.read(id, clip, self._bars) for id, clip in sorted(
-            self._document["clips"].items(),
-            key=lambda item: (item[1]["start"], item[1].get("z_index", 0), item[0])))
+    def label(self):
+        return f"{self.name or self.title} @ {self.venue.name}"
 
-    def source(self):
-        """The score JSON, with groups named."""
-        return json.dumps(self._document, indent=2, sort_keys=True)
+    def edit(self):
+        raise TrackReadOnlyError(
+            "a reference score is read-only; take what you need from it and write with luma.track.edit()")
 
     def _by_look(self):
         looks = OrderedDict()
@@ -151,9 +145,9 @@ class Reference:
         lines = [f"{self!r}"]
         for name, entry in self._by_look().items():
             beats = sorted(entry["beats"])[len(entry["beats"]) // 2]
-            span = self._bars.format(entry["first"])
+            span = self.bars.format(entry["first"])
             if entry["count"] > 1:
-                span += f" to {self._bars.format(entry['last'])}"
+                span += f" to {self.bars.format(entry['last'])}"
             lines.append(
                 f"  {name}: {entry['count']}x {entry['output']} {'/'.join(sorted(entry['blend']))}, "
                 f"{beats:g} beats, on {' | '.join(entry['groups'])}, {span}")
@@ -164,7 +158,7 @@ class Reference:
         entry = self._by_look().get(name)
         if entry is None:
             raise KeyError(f"no look named {name!r}; looks() lists them")
-        return Clip.read(entry["id"], self._document["clips"][entry["id"]], self._bars)
+        return Clip.read(entry["id"], self._document["clips"][entry["id"]], self.bars)
 
     def roles(self):
         """What each group of that rig is made of and which looks it carries."""
@@ -172,7 +166,7 @@ class Reference:
         for name, entry in self._by_look().items():
             for group, count in entry["groups"].items():
                 carried.setdefault(group, []).append(f"{name} {count}x")
-        made = {group["name"]: group for group in self.venue.groups()}
+        made = {group["name"]: group for group in self._rig}
         lines = [f"{self.venue.name}: what each group did"]
         for group in list(made) + [g for g in carried if g not in made]:
             info = made.get(group)
@@ -187,34 +181,39 @@ class Reference:
 
     def __repr__(self):
         name = f"{self.name!r} · " if self.name else ""
-        return (f"<reference {name}{self.track!r} @ {self.venue.name} "
-                f"clips={len(self._document['clips'])} read-only; looks(), roles(), clips, venue>")
+        return (f"<reference {name}{self.title!r} @ {self.venue.name} "
+                f"clips={len(self._document['clips'])} read-only; looks(), roles(), clips, window(), venue>")
 
 
 class Scores:
     """Your other scores. `find()` lists them; `open(found[0])` reads one."""
 
-    def __init__(self, track):
-        self._track = track
+    def __init__(self, track, figures=None):
+        self._track, self._figures = track, figures
 
-    def find(self, text=None, *, track=None):
+    def find(self, text=None, *, track=None, venue=None, uses=None, limit=20):
         """Your scores, this song's first and then the newest.
 
-        `text` matches the score, song, artist or venue name; `track` is a
-        track id, such as `luma.track.id` for this song on other rigs. The
-        score you are editing is left out.
+        `text` is words that must each appear in the score, song, artist or
+        venue name. `track` is a track id, such as `luma.track.id` for this
+        song on other rigs. `venue` is a venue name or part of one. `uses` is
+        part of a clip name, such as a preset's. Filters combine. The score
+        you are editing is left out.
         """
         answer = self._track._call("track.scores_find", {
             "text": None if text is None else str(text),
             "track_id": None if track is None else str(getattr(track, "id", track)),
+            "venue": None if venue is None else str(venue),
+            "uses": None if uses is None else str(uses),
+            "limit": int(limit),
         })
-        return Found(FoundScore(row) for row in answer["scores"])
+        return Found((FoundScore(row) for row in answer["scores"]), answer.get("more", False))
 
     def open(self, score):
         """Read one score: a `find` item, or a score id."""
         answer = self._track._call("track.scores_open", {"id": str(getattr(score, "id", score))})
-        bars = self._track.bars if answer.get("same_track") else BarGrid((0.0,), 4)
-        return Reference(answer, bars)
+        return Reference(answer, self._track, self._figures)
 
     def __repr__(self):
-        return "<luma.scores: find(text=None, track=None), open(score)>"
+        return ("<luma.scores: find(text=None, track=None, venue=None, uses=None), "
+                "open(score)>")

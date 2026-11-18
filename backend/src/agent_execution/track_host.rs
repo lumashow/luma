@@ -215,6 +215,9 @@ impl HostCallHandler for TrackHost {
         // Tokio still owns every database/compositor operation.
         context.check()?;
         let limit = call_limit(context)?;
+        if method == "track.scores_read" {
+            return self.scores_read(payload, context);
+        }
         self.runtime.block_on(async {
             if matches!(
                 method,

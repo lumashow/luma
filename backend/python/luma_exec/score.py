@@ -44,6 +44,9 @@ from .track import (TrackOutput, TrackError, TrackReadOnlyError,
 # and still count as ending where it starts.
 _TOUCH = 1e-6
 
+# The most frames one filmstrip holds: each is a full render of the stage.
+_STRIP_FRAMES = 16
+
 
 def _plain(value):
     if hasattr(value, "items"):
@@ -319,6 +322,11 @@ class GraphTrack(_ImmutableSnapshot):
         and what stays dark, each beside what finished shows measure.
         """
         return Review(self, self._document)
+
+    @property
+    def label(self):
+        """What a figure of this score is titled with."""
+        return self.title
 
     def __repr__(self):
         return f"<luma.track {self.title!r} clips={len(self.clips)} editable={self.editable}>"
@@ -1000,6 +1008,8 @@ class Window(_ImmutableSnapshot):
 
     at is the range as two positions; bars is the same range in bars from 1,
     such as (17, 21). start_s and end_s are the range in seconds.
+    timeline() plots the clips, output.heatmap() the light per fixture and
+    filmstrip() the stage itself at several moments.
     """
 
     def __init__(self, track, document, span):
@@ -1015,6 +1025,7 @@ class Window(_ImmutableSnapshot):
             end = track._beat_at(self.end_s)
             print(f"window: clamped to the end of the track: {self.end_s:.3f} s")
         grid = track.bars
+        self._span = (start, end)
         self.at = (grid.format(start), grid.format(end))
         self.bars = (grid.bar_number(start), grid.bar_number(end))
         self.clips = tuple(Clip.read(id, clip, grid) for id, clip in document["clips"].items()
@@ -1025,6 +1036,55 @@ class Window(_ImmutableSnapshot):
     def _render(self):
         return self._track._call("track.score_render", {"candidate": copy.deepcopy(self._document),
                                                        "startTime": self.start_s, "endTime": self.end_s})
+
+    def filmstrip(self, frames=8, *, at=None, view="front", width=480, height=270):
+        """The stage at several moments of this range, as one picture.
+
+        frames moments, evenly spaced from the start of the range, so 8
+        frames over 8 bars is the first beat of each bar. at=["17", "19.3"]
+        picks the moments instead. Each frame is the venue's real renderer
+        with this window's score playing, labelled with its position. The
+        same range gives the same moments on any rig, so a reference's strip
+        and an edit's strip read side by side. view is one of the venue's
+        views. At most 16 frames.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.image import imread
+
+        track = self._track
+        if at is None:
+            if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= _STRIP_FRAMES:
+                raise TrackError(f"frames is a whole number from 1 to {_STRIP_FRAMES}")
+            start, end = self._span
+            beats = [start + index * (end - start) / frames for index in range(frames)]
+        else:
+            if isinstance(at, (str, bytes)) or not 1 <= len(at) <= _STRIP_FRAMES:
+                raise TrackError(f'at is a list of 1 to {_STRIP_FRAMES} positions, such as ["17", "19.3"]')
+            beats = [track.bars.parse(position) for position in at]
+        store = track._artifact_store
+        if store is None:
+            raise TrackHostUnavailableError("a filmstrip needs Luma's host to render the stage")
+        shots = []
+        for beat in beats:
+            response = track._call("venue.render", {
+                "view": str(view), "t": track._seconds_at(beat), "width": int(width), "height": int(height),
+                "edit": copy.deepcopy(self._document)})
+            path = store.workspace / str(response["artifactRel"])
+            shots.append((track.bars.format(beat), imread(path)))
+            # The strip is the figure; its frames are not figures of their own.
+            path.unlink(missing_ok=True)
+        columns = min(len(shots), 4)
+        rows = math.ceil(len(shots) / columns)
+        fig, axes = plt.subplots(rows, columns, squeeze=False, dpi=160,
+                                 figsize=(3 * columns, (3 * height / width + 0.3) * rows + 0.4))
+        for ax in axes.flat:
+            ax.set_axis_off()
+        for ax, (position, image) in zip(axes.flat, shots):
+            ax.imshow(image)
+            ax.set_title(position, fontsize=9)
+        fig.suptitle(f"{track.label} · {'-'.join(self.at)}", fontsize=10)
+        fig.tight_layout()
+        return fig
 
     def timeline(self):
         import matplotlib.pyplot as plt

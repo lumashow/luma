@@ -139,6 +139,131 @@ pub async fn list_accessible_scores_for_track(
         .map_err(|error| format!("Failed to list accessible scores for track: {error}"))
 }
 
+/// What [`find_own_scores`] narrows by. Every field narrows further; none set
+/// lists every score of the principal's.
+#[derive(Debug, Default, Clone)]
+pub struct ScoreSearch {
+    /// Words that must each appear in the track's title or artist, the
+    /// venue's name or the score's name.
+    pub text: Option<String>,
+    /// A track id: scores of that audio, whichever track row holds it.
+    pub track: Option<String>,
+    /// A venue id, or part of its name.
+    pub venue: Option<String>,
+    /// Part of the name of a clip the score holds.
+    pub uses: Option<String>,
+    /// A score left out: the one the caller already has open.
+    pub except: Option<String>,
+    /// A track id whose scores are listed before the rest.
+    pub first: Option<String>,
+}
+
+/// One score of the library, as a search lists it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow, serde::Serialize)]
+pub struct FoundScore {
+    pub id: String,
+    pub name: Option<String>,
+    pub track_id: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub venue_id: String,
+    pub venue_name: String,
+    pub clips: i64,
+    pub edited_at: Option<String>,
+}
+
+/// Search the scores the current principal wrote, in every venue the
+/// admission still lets them open, last written first. A score someone else
+/// wrote in one of those venues is not listed.
+pub async fn find_own_scores(
+    pool: &SqlitePool,
+    search: &ScoreSearch,
+    limit: u32,
+) -> Result<Vec<FoundScore>, String> {
+    /// `%word%` with LIKE's own wildcards escaped, so a name with `_` or `%`
+    /// in it matches itself.
+    fn contains(word: &str) -> String {
+        let mut pattern = String::from("%");
+        for character in word.chars() {
+            if matches!(character, '%' | '_' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(character);
+        }
+        pattern.push('%');
+        pattern
+    }
+    const SAME_AUDIO: &str = "track.track_hash = (SELECT track_hash FROM tracks WHERE id = ";
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT score.id, score.name, score.track_id, track.title, track.artist,
+                score.venue_id, venue.name AS venue_name,
+                (SELECT COUNT(*) FROM clips WHERE clips.score_id = score.id) AS clips,
+                COALESCE(score.authored_at, score.updated_at) AS edited_at
+         FROM scores score
+         JOIN venues venue ON venue.id = score.venue_id
+         JOIN auth_venue_access access ON access.venue_id = score.venue_id
+         JOIN tracks track ON track.id = score.track_id
+         WHERE score.uid IS access.principal",
+    );
+    if let Some(except) = &search.except {
+        query.push(" AND score.id != ").push_bind(except);
+    }
+    if let Some(track) = &search.track {
+        query
+            .push(" AND ")
+            .push(SAME_AUDIO)
+            .push_bind(track)
+            .push(")");
+    }
+    if let Some(venue) = &search.venue {
+        query
+            .push(" AND (venue.id = ")
+            .push_bind(venue)
+            .push(" OR venue.name LIKE ")
+            .push_bind(contains(venue))
+            .push(" ESCAPE '\\')");
+    }
+    for word in search.text.iter().flat_map(|text| text.split_whitespace()) {
+        query.push(" AND (");
+        for (index, column) in ["track.title", "track.artist", "venue.name", "score.name"]
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                query.push(" OR ");
+            }
+            query
+                .push(column)
+                .push(" LIKE ")
+                .push_bind(contains(word))
+                .push(" ESCAPE '\\'");
+        }
+        query.push(")");
+    }
+    if let Some(uses) = &search.uses {
+        query
+            .push(
+                " AND EXISTS (SELECT 1 FROM clips
+                               WHERE clips.score_id = score.id AND clips.name LIKE ",
+            )
+            .push_bind(contains(uses))
+            .push(" ESCAPE '\\')");
+    }
+    query.push(" ORDER BY ");
+    if let Some(first) = &search.first {
+        query.push(SAME_AUDIO).push_bind(first).push(") DESC, ");
+    }
+    query
+        .push("datetime(edited_at) DESC, score.rowid DESC LIMIT ")
+        .push_bind(i64::from(limit));
+    query
+        .build_query_as::<FoundScore>()
+        .fetch_all(pool)
+        .await
+        .map_err(|error| format!("Failed to search scores: {error}"))
+}
+
 /// Fetch a score by ID
 pub async fn get_score(access: &mut impl AuthorizedVenue, id: &str) -> Result<Score, String> {
     sqlx::query_as::<_, Score>(
@@ -270,5 +395,121 @@ pub(crate) mod tests {
         // below `#2`, whichever way the two rows spell their timestamps.
         let ordinals: Vec<i64> = listed.iter().map(|score| score.ordinal).collect();
         assert_eq!(ordinals, [4, 3, 2, 1]);
+    }
+
+    /// Alice's library: one song lit in two rooms, another song in the first
+    /// room, a score of Bob's in her room, and one in a room she cannot open.
+    async fn library() -> (tempfile::TempDir, SqlitePool) {
+        let (directory, pool) = test_pool().await;
+        sqlx::query(
+            "INSERT INTO tracks (id, uid, file_path, title, artist, track_hash) VALUES
+                ('song', 'alice', '/a.wav', 'Night Drive', 'Kavinsky', 'hash-a'),
+                ('song-again', 'alice', '/a2.wav', 'Night Drive (copy)', 'Kavinsky', 'hash-a'),
+                ('other', 'alice', '/b.wav', 'Sunrise', 'Bonobo', 'hash-b');
+             INSERT INTO venues (id, uid, name) VALUES
+                ('gasworks', 'alice', 'Gasworks'),
+                ('attic', 'alice', 'The 100% Attic'),
+                ('bobs', 'bob', 'Bob''s Bar');
+             INSERT INTO scores (id, uid, track_id, venue_id, name, authored_at) VALUES
+                ('here', 'alice', 'song', 'attic', 'Attic show', '2026-03-01T00:00:00Z'),
+                ('there', 'alice', 'song', 'gasworks', 'Main show', '2026-02-01T00:00:00Z'),
+                ('copy', 'alice', 'song-again', 'gasworks', 'Alt', '2026-01-01T00:00:00Z'),
+                ('sunrise', 'alice', 'other', 'gasworks', 'Warm', '2026-04-01T00:00:00Z'),
+                ('guest', 'bob', 'song', 'gasworks', 'Bob in her room', '2026-06-01T00:00:00Z'),
+                ('sealed', 'bob', 'song', 'bobs', 'Bob show', '2026-05-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, score, name) in [
+            ("there:1", "there", "Kick chase"),
+            ("there:2", "there", "Wash"),
+            ("sunrise:1", "sunrise", "Wash"),
+        ] {
+            sqlx::query(
+                "INSERT INTO clips (id, uid, score_id, name, graph, start, duration, seed,
+                                    selection_json, blend_mode)
+                 VALUES (?, 'alice', ?, ?, '', 0, 4, '1', '{}', 'replace')",
+            )
+            .bind(id)
+            .bind(score)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        crate::database::local::auth::arm_write_admission(&pool, Some("alice"))
+            .await
+            .unwrap();
+        (directory, pool)
+    }
+
+    async fn found(pool: &SqlitePool, search: ScoreSearch) -> Vec<String> {
+        find_own_scores(pool, &search, 20)
+            .await
+            .expect("the search")
+            .into_iter()
+            .map(|score| score.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_search_lists_the_persons_own_scores_last_written_first() {
+        let (_directory, pool) = library().await;
+        assert_eq!(
+            found(&pool, ScoreSearch::default()).await,
+            ["sunrise", "here", "there", "copy"],
+            "someone else's score was listed, or the order is not by last write"
+        );
+        let listed = find_own_scores(&pool, &ScoreSearch::default(), 20)
+            .await
+            .unwrap();
+        let there = listed.iter().find(|score| score.id == "there").unwrap();
+        assert_eq!((there.clips, there.venue_name.as_str()), (2, "Gasworks"));
+    }
+
+    #[tokio::test]
+    async fn each_filter_narrows_the_search() {
+        let (_directory, pool) = library().await;
+        let search = |edit: fn(&mut ScoreSearch)| {
+            let mut search = ScoreSearch::default();
+            edit(&mut search);
+            search
+        };
+        // The same audio under another track row is the same song.
+        assert_eq!(
+            found(
+                &pool,
+                search(|s| {
+                    s.track = Some("song".into());
+                    s.except = Some("here".into());
+                })
+            )
+            .await,
+            ["there", "copy"]
+        );
+        assert_eq!(
+            found(&pool, search(|s| s.venue = Some("gas".into()))).await,
+            ["sunrise", "there", "copy"]
+        );
+        // Every word must match somewhere, in any of the four names.
+        assert_eq!(
+            found(&pool, search(|s| s.text = Some("kavinsky MAIN".into()))).await,
+            ["there"]
+        );
+        assert_eq!(
+            found(&pool, search(|s| s.uses = Some("kick".into()))).await,
+            ["there"]
+        );
+        // A wildcard in a name is a character, not a pattern.
+        assert_eq!(
+            found(&pool, search(|s| s.text = Some("100%".into()))).await,
+            ["here"]
+        );
+        // One song's scores lead, and the rest follow by last write.
+        assert_eq!(
+            found(&pool, search(|s| s.first = Some("song".into()))).await,
+            ["here", "there", "copy", "sunrise"]
+        );
     }
 }
