@@ -25,7 +25,7 @@
 
 use std::time::Instant;
 
-use gpui::{div, prelude::*, px, AnyElement, EntityId, SharedString};
+use gpui::{div, prelude::*, px, AnyElement, EntityId};
 use luma_ui::motion;
 use luma_ui::node::{Instrument as _, Role as NodeRole};
 
@@ -193,6 +193,7 @@ const TRAILER_HEIGHT: f32 = TRAILER_GAP + TRAILER_LINE;
 /// long it has been going.
 pub fn trailer(trailer: &Trailer, theme: &Theme, view: EntityId, cx: &mut gpui::App) -> AnyElement {
     let secs = trailer.since.elapsed().as_secs();
+    let reduced = motion::reduced_motion(cx);
     let (word, timer) = match trailer.state {
         Working::Sending => ("Sending".to_string(), None),
         Working::Thinking => (
@@ -211,17 +212,27 @@ pub fn trailer(trailer: &Trailer, theme: &Theme, view: EntityId, cx: &mut gpui::
         .pt(px(TRAILER_GAP))
         .text_size(px(12.0))
         .child(spinner(view, cx))
+        // The word and the timer roll to what they say next: only the
+        // characters that changed move.
         .child(
             div()
                 .w(px(112.0))
                 .flex_none()
                 .text_color(theme.text_muted)
-                .child(SharedString::from(word)),
+                .child(luma_ui::roll_text::roll_text(
+                    format!("working-word-{view}"),
+                    word.into(),
+                    reduced,
+                )),
         )
         .children(timer.map(|timer| {
             div()
                 .text_color(theme.text_faint)
-                .child(SharedString::from(timer))
+                .child(luma_ui::roll_text::roll_text(
+                    format!("working-timer-{view}"),
+                    timer.into(),
+                    reduced,
+                ))
         }))
         .agent_node(NodeRole::Text, trailer.state.label())
         .into_any_element()

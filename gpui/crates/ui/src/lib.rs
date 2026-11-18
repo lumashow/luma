@@ -50,6 +50,7 @@ pub mod dialog;
 pub mod float;
 pub mod fonts;
 pub mod glass;
+pub mod haptics;
 pub mod ladder;
 pub mod mark;
 pub mod menu;
@@ -62,6 +63,7 @@ pub mod pill;
 pub mod progress;
 pub mod radius;
 pub mod rem_scale;
+pub mod roll_text;
 pub mod runtime;
 pub mod scrub_number;
 pub mod sheet;
@@ -73,7 +75,7 @@ pub mod text_input;
 mod button;
 mod drag;
 mod select;
-mod slider;
+pub mod slider;
 mod text;
 
 /// The key context a focused field declares while it is taking typed text.

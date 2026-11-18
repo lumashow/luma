@@ -87,10 +87,12 @@ pub enum RowKind {
     /// A run of consecutive tool calls, as one group. `count` is the span of
     /// parts it covers, which can include parts that paint nothing.
     Tools { part: usize, count: usize },
-    /// The one header a compact turn's work folds behind: thinking, tool calls
-    /// and narration are the rows between it and the final reply, present
-    /// only while it is open.
-    Work,
+    /// The header a run of a compact turn's work folds behind: the thinking
+    /// and tool calls between one stretch of written text and the next,
+    /// which are the rows under it while it is open. `part` is the run's
+    /// first part and `count` the span it covers. What the turn wrote is
+    /// never folded.
+    Work { part: usize, count: usize },
 }
 
 /// A row's whole identity: which turn, which block of it, and a hash of what
@@ -180,20 +182,46 @@ pub fn rows_for(
 /// How a transcript lays out its assistant turns.
 #[derive(Clone, Copy)]
 pub struct Compact<'a> {
-    /// Fold each turn's work behind one header.
+    /// Fold each run of a turn's work behind a header.
     pub on: bool,
-    /// The messages whose header the reader has opened, by message id.
+    /// The runs whose header the reader has opened, by [`work_key`].
     pub open: &'a HashSet<SharedString>,
 }
 
-/// The part that is the turn's final reply: its last painting part, when that
-/// is prose. Anything before it is work; a turn that ends on a tool call or on
-/// thinking has no reply yet, and all of it is work.
-fn final_reply(message: &AgentChatMessage, turn: &Entry) -> Option<usize> {
-    let last = (0..message.parts.len())
-        .rev()
-        .find(|&part| !paints_nothing(message, turn, part))?;
-    matches!(message.parts[last], AgentChatPart::Text { .. }).then_some(last)
+/// What names one run of work: its message, and the part it starts at.
+#[must_use]
+pub fn work_key(message_id: &str, part: usize) -> SharedString {
+    SharedString::from(format!("{message_id}:{part}"))
+}
+
+/// Whether `part` is text the turn wrote that paints: what a compact turn
+/// never folds, and what ends a run of work.
+fn written(message: &AgentChatMessage, turn: &Entry, part: usize) -> bool {
+    matches!(message.parts.get(part), Some(AgentChatPart::Text { .. }))
+        && !paints_nothing(message, turn, part)
+}
+
+/// The end of the run of work starting at `part`: the next written text, or
+/// the turn's end.
+fn work_end(message: &AgentChatMessage, turn: &Entry, part: usize) -> usize {
+    (part..message.parts.len())
+        .find(|&next| written(message, turn, next))
+        .unwrap_or(message.parts.len())
+}
+
+/// How many runs of work a compact turn has.
+fn work_runs(message: &AgentChatMessage, turn: &Entry) -> usize {
+    let mut runs = 0;
+    let mut part = 0;
+    while part < message.parts.len() {
+        if paints_nothing(message, turn, part) || written(message, turn, part) {
+            part += 1;
+        } else {
+            runs += 1;
+            part = work_end(message, turn, part);
+        }
+    }
+    runs
 }
 
 fn push_assistant_rows(
@@ -204,28 +232,35 @@ fn push_assistant_rows(
     streaming: bool,
     compact: Compact,
 ) {
-    let all = 0..message.parts.len();
     if !compact.on {
-        return push_part_rows(rows, ix, message, turn, streaming, all);
+        return push_part_rows(rows, ix, message, turn, streaming, 0..message.parts.len());
     }
-    let reply = final_reply(message, turn);
-    let work = 0..reply.unwrap_or(message.parts.len());
-    if work.clone().all(|part| paints_nothing(message, turn, part)) {
-        return push_part_rows(rows, ix, message, turn, streaming, all);
-    }
-    let open = compact.open.contains(message.id.as_str());
-    let seed = fnv1a(FNV_OFFSET, &[u8::from(open)]);
-    let hash = fnv1a(seed, &message.worked_ms().unwrap_or(0).to_le_bytes());
-    rows.push(RowKey {
-        turn: ix,
-        kind: RowKind::Work,
-        version: version(hash, streaming),
-    });
-    if open {
-        push_part_rows(rows, ix, message, turn, streaming, work);
-    }
-    if let Some(reply) = reply {
-        push_part_rows(rows, ix, message, turn, streaming, reply..reply + 1);
+    let mut part = 0;
+    while part < message.parts.len() {
+        if paints_nothing(message, turn, part) {
+            part += 1;
+        } else if written(message, turn, part) {
+            push_part_rows(rows, ix, message, turn, streaming, part..part + 1);
+            part += 1;
+        } else {
+            let end = work_end(message, turn, part);
+            let open = compact.open.contains(&work_key(&message.id, part));
+            let seed = fnv1a(FNV_OFFSET, &[u8::from(open)]);
+            let seed = fnv1a(seed, &(end - part).to_le_bytes());
+            let hash = fnv1a(seed, &message.worked_ms().unwrap_or(0).to_le_bytes());
+            rows.push(RowKey {
+                turn: ix,
+                kind: RowKind::Work {
+                    part,
+                    count: end - part,
+                },
+                version: version(hash, streaming),
+            });
+            if open {
+                push_part_rows(rows, ix, message, turn, streaming, part..end);
+            }
+            part = end;
+        }
     }
 }
 
@@ -361,8 +396,8 @@ pub fn top_gap_for(previous: Option<&RowKey>, row: &RowKey) -> f32 {
         // were one element a moment ago and will be again on the next reparse,
         // so the split cannot be allowed to move anything.
         theme::GAP_TOOL
-    } else if matches!(previous.kind, RowKind::Tools { .. } | RowKind::Work)
-        || matches!(row.kind, RowKind::Tools { .. } | RowKind::Work)
+    } else if matches!(previous.kind, RowKind::Tools { .. } | RowKind::Work { .. })
+        || matches!(row.kind, RowKind::Tools { .. } | RowKind::Work { .. })
     {
         theme::GAP_TOOL
     } else {
@@ -715,6 +750,16 @@ pub fn trim_caches(entries: &[Entry], viewed: &Viewed) {
 
 /// What a compact turn's header says once the turn has settled.
 #[must_use]
+/// What one run of work did, for its header when a turn has several: how
+/// many tools it called, or that it only thought.
+fn run_label(message: &AgentChatMessage, run: Range<usize>) -> String {
+    match run.filter(|&part| tool_at(message, part).is_some()).count() {
+        0 => "Thought".to_string(),
+        1 => "1 tool call".to_string(),
+        calls => format!("{calls} tool calls"),
+    }
+}
+
 pub fn worked_label(worked_ms: Option<u64>) -> String {
     let Some(ms) = worked_ms else {
         return "Worked".to_string();
@@ -828,7 +873,6 @@ pub struct RowCtx<'a> {
     /// Whether this is its turn's last row: the one that carries the working
     /// trailer and the timestamp lane.
     pub last_of_turn: bool,
-    pub flying: bool,
     /// The working indicator, on the one row that carries it — the last. See
     /// [`crate::working`] for why it trails a row rather than pinning to the
     /// panel.
@@ -837,6 +881,8 @@ pub struct RowCtx<'a> {
     pub expanded: &'a HashSet<SharedString>,
     /// Compact turns the reader has opened, by message id.
     pub open_work: &'a HashSet<SharedString>,
+    /// The long prompts the reader has opened, by row key.
+    pub open_prompts: &'a HashSet<SharedString>,
     /// Python calls, read. Interior-mutable because a row reads its call
     /// *during* the panel's own render, when the panel entity is already
     /// borrowed — see [`crate::python_cell`] for why the reading is cached at
@@ -846,8 +892,8 @@ pub struct RowCtx<'a> {
     pub viewed: &'a Viewed,
     /// What a python card loads its figures through.
     pub agent: &'a crate::Agent,
-    /// The one fold in flight, if any: which call, and how far through its
-    /// tween it is. At most one, because a fold is started by a click and a
+    /// The one fold in flight, if any: which call, and how open its card is
+    /// this frame, 0..1. At most one, because a fold is started by a click and a
     /// click lands on one chip.
     pub fold: Option<(&'a SharedString, f32)>,
     /// Where the folding call's chip writes its card's height this layout,
@@ -882,7 +928,7 @@ impl RowCtx<'_> {
         self.expanded.contains(call_id)
     }
 
-    /// How far through its fold this call is, or `None` when it is not moving.
+    /// How open this call's card is mid-fold, or `None` when it is not moving.
     #[must_use]
     pub fn fold_progress(&self, call_id: &str) -> Option<f32> {
         self.fold
@@ -909,21 +955,13 @@ pub fn row(
         RowKind::Prompt => {
             let text = prompt_text(message);
             let attached = attached(message);
-            (
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .opacity(if ctx.flying { 0.0 } else { 1.0 })
-                            .child(user_bubble(&text, &turn.key, theme)),
-                    )
-                    .when(!attached.is_empty(), |row| {
-                        row.child(attached_note(attached, theme))
-                    })
-                    .into_any_element(),
-                text,
-            )
+            let fold = PromptFold::of(&text, ctx.open_prompts.contains(&turn.key), {
+                let (chat, key, row) = (ctx.chat.clone(), turn.key.clone(), ctx.ix);
+                move |cx| {
+                    chat.update(cx, |this, cx| this.toggle_prompt(key.clone(), row, cx));
+                }
+            });
+            (prompt_body(&text, &turn.key, attached, fold, theme), text)
         }
         // Left-aligned and faint, deliberately unlike the user bubble beside
         // it: this line is a marker in the record, not something anyone said.
@@ -952,14 +990,23 @@ pub fn row(
                 .join("\n");
             (chip::rail(&tools, ctx, window, cx), plain)
         }
-        RowKind::Work => {
-            let label = if ctx.live {
+        RowKind::Work { part, count } => {
+            // The run still being worked on: the live turn's last, with
+            // nothing written after it yet.
+            let running = ctx.live && part + count == message.parts.len();
+            let label = if running {
                 "Working".to_string()
-            } else {
+            } else if work_runs(message, turn) == 1 {
                 worked_label(message.worked_ms())
+            } else {
+                run_label(message, part..part + count)
             };
-            let open = ctx.open_work.contains(message.id.as_str());
-            (chip::work_header(&label, open, message, ctx, cx), label)
+            let key = work_key(&message.id, part);
+            let open = ctx.open_work.contains(&key);
+            (
+                chip::work_header(&label, open, key, running, ctx, cx),
+                label,
+            )
         }
         RowKind::Block {
             part,
@@ -983,7 +1030,7 @@ pub fn row(
     let trailer = ctx
         .trailer
         .as_ref()
-        .filter(|_| !matches!(key.kind, RowKind::Work))
+        .filter(|_| !matches!(key.kind, RowKind::Work { .. }))
         .map(|state| crate::working::trailer(state, theme, view, cx));
     // A settled assistant turn is signed with when it arrived — comet's faint
     // line under the reply, revealed on hover. A live turn is not signed at
@@ -1007,6 +1054,7 @@ pub fn row(
             .items_center()
             .gap(px(theme::SPACE_SM))
             .children(ctx.verdict.as_ref().map(|turn| thumbs(turn, ctx.chat)))
+            .children((!ctx.live).then(|| copy_reply(message, &group)))
             .children(stamp.map(|stamp| {
                 div()
                     .opacity(0.0)
@@ -1038,6 +1086,29 @@ pub fn row(
         )
         .agent_node(NodeRole::Text, plain)
         .into_any_element()
+}
+
+/// Copy a finished reply's text. Shown with the timestamp, on hover; the
+/// lane it sits in is reserved, so it moves nothing.
+fn copy_reply(message: &AgentChatMessage, group: &SharedString) -> impl IntoElement {
+    let text = message.text();
+    div()
+        .id(SharedString::from(format!("chat-copy-{}", message.id)))
+        .size(px(theme::TIMESTAMP_LANE))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(luma_ui::radius::CONTROL))
+        .cursor_pointer()
+        .opacity(0.0)
+        .group_hover(group.clone(), |style| style.opacity(1.0))
+        .hover(|style| style.bg(theme::wash(0.06)))
+        .child(Icon::new(IconName::Copy).size(px(13.0)))
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        })
+        .agent_node(NodeRole::Button, "Copy response")
 }
 
 /// A finished turn's thumbs: good and bad, the given one lit. Pressing the lit
@@ -1093,7 +1164,29 @@ fn thumbs(turn: &TurnVerdict, chat: &Entity<AgentChat>) -> impl IntoElement {
 /// paint pass registers it into the frame's selection registry through the
 /// same [`luma_md::render::paint_text_selection`] path the markdown rows take,
 /// so a drag from a reply up through a prompt carries it and Cmd+C copies it.
-pub(crate) fn user_bubble(text: &str, turn_key: &SharedString, theme: &Theme) -> AnyElement {
+pub(crate) fn user_bubble(
+    text: &str,
+    turn_key: &SharedString,
+    fold: Option<PromptFold>,
+    theme: &Theme,
+) -> AnyElement {
+    let clipped = fold.as_ref().is_some_and(|fold| !fold.open);
+    let hover = theme.text;
+    let more = fold.map(|fold| {
+        let label = if fold.open { "Show less" } else { "Show more" };
+        div()
+            .id(SharedString::from(format!("chat-prompt-fold-{turn_key}")))
+            .pt(px(theme::SPACE_XS))
+            .text_size(px(12.0))
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(move |style| style.text_color(hover))
+            .child(label)
+            .when_some(fold.toggle, |el, toggle| {
+                el.on_click(move |_, _, cx| toggle(cx))
+            })
+            .agent_node(NodeRole::Button, label)
+    });
     let content: SharedString = text.to_string().into();
     let run = gpui::TextRun {
         len: content.len(),
@@ -1141,9 +1234,85 @@ pub(crate) fn user_bubble(text: &str, turn_key: &SharedString, theme: &Theme) ->
                 .text_size(px(MD_TEXT_SIZE))
                 .line_height(px(MD_LINE_HEIGHT))
                 .text_color(theme.text)
-                .child(div().relative().child(underlay).child(styled)),
+                .child(
+                    div()
+                        .relative()
+                        .when(clipped, |el| {
+                            el.max_h(px(theme::PROMPT_CLIP_LINES as f32 * MD_LINE_HEIGHT))
+                                .overflow_hidden()
+                        })
+                        .child(underlay)
+                        .child(styled),
+                )
+                .children(more),
         )
         .into_any_element()
+}
+
+/// A prompt long enough to clip: whether the reader has opened it, and what
+/// its "Show more" does. A prompt not accepted yet has nothing to do.
+pub struct PromptFold {
+    open: bool,
+    toggle: Option<Box<dyn Fn(&mut gpui::App)>>,
+}
+
+impl PromptFold {
+    /// The fold for `text`, or `None` when it is short enough to show whole.
+    pub fn of(text: &str, open: bool, toggle: impl Fn(&mut gpui::App) + 'static) -> Option<Self> {
+        is_long_prompt(text).then(|| Self {
+            open,
+            toggle: Some(Box::new(toggle)),
+        })
+    }
+
+    /// The fold of a prompt that has no row yet: clipped, and inert.
+    #[must_use]
+    pub fn pending(text: &str) -> Option<Self> {
+        is_long_prompt(text).then_some(Self {
+            open: false,
+            toggle: None,
+        })
+    }
+}
+
+/// Whether a prompt is clipped behind "Show more": a pasted log should not
+/// push the reply it asked for off the screen.
+fn is_long_prompt(text: &str) -> bool {
+    text.lines().count() > theme::PROMPT_CLIP_LINES
+        || text.chars().count() > theme::PROMPT_CLIP_CHARS
+}
+
+/// A prompt as its row shows it: the bubble, and under it what the editor
+/// sent along (`attached`, empty for nothing). One function for the accepted
+/// row and for the copy shown while the backend has not accepted it yet, so
+/// accepting a prompt moves nothing.
+pub fn prompt_body(
+    text: &str,
+    key: &SharedString,
+    attached: String,
+    fold: Option<PromptFold>,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(user_bubble(text, key, fold, theme))
+        .when(!attached.is_empty(), |row| {
+            row.child(attached_note(attached, theme))
+        })
+        .into_any_element()
+}
+
+/// The gap above a prompt that starts a new exchange: none at the head of
+/// the thread, the turn gap after anything else. What [`top_gap_for`] gives
+/// a prompt's row, for a prompt that has no row yet.
+#[must_use]
+pub fn prompt_gap(first: bool) -> f32 {
+    if first {
+        0.0
+    } else {
+        theme::GAP_TURN
+    }
 }
 
 /// What the editor sent along with a prompt, under its bubble: one faint
@@ -1311,34 +1480,42 @@ mod tests {
         assert_eq!(rows[0].kind, RowKind::Tools { part: 0, count: 4 });
     }
 
-    /// Compact: the work folds behind one header and the final reply stays;
-    /// opening the header shows the work as ordinary rows between the two.
+    fn probe(id: &str) -> AgentChatPart {
+        AgentChatPart::Tool(ToolPart {
+            name: Some("probe".into()),
+            dynamic: false,
+            call_id: id.into(),
+            state: luma_lib::agent::ToolState::InputAvailable,
+            input: None,
+            output: None,
+            error_text: None,
+        })
+    }
+
+    fn thinking() -> AgentChatPart {
+        AgentChatPart::Reasoning {
+            text: "thinking".into(),
+            started_at: None,
+            last_delta_at: None,
+        }
+    }
+
+    /// Compact: what a turn wrote always shows, and each run of thinking
+    /// and tool calls between two stretches of writing folds behind a header
+    /// of its own. Opening one header shows that run's work and no other's.
     #[test]
-    fn a_compact_turn_folds_its_work_behind_one_header() {
+    fn a_compact_turn_folds_each_run_of_work_and_never_its_writing() {
+        let text = |text: &str| AgentChatPart::Text { text: text.into() };
         let message = AgentChatMessage {
             id: "a".into(),
             role: Role::Assistant,
             parts: vec![
-                AgentChatPart::Reasoning {
-                    text: "thinking".into(),
-                    started_at: None,
-                    last_delta_at: None,
-                },
-                AgentChatPart::Tool(ToolPart {
-                    name: Some("probe".into()),
-                    dynamic: false,
-                    call_id: "1".into(),
-                    state: luma_lib::agent::ToolState::InputAvailable,
-                    input: None,
-                    output: None,
-                    error_text: None,
-                }),
-                AgentChatPart::Text {
-                    text: "narration".into(),
-                },
-                AgentChatPart::Text {
-                    text: "the answer".into(),
-                },
+                thinking(),
+                probe("1"),
+                text("narration"),
+                probe("2"),
+                probe("3"),
+                text("the answer"),
             ],
         };
         let mut entry = Entry::restored("a");
@@ -1348,47 +1525,78 @@ mod tests {
             messages: vec![message],
         };
         let none = HashSet::new();
-        let open = HashSet::from([SharedString::from("a")]);
+        let first = HashSet::from([work_key("a", 0)]);
         let rows = |open: &HashSet<SharedString>, on| {
             rows_for(&transcript, &entries, None, Compact { on, open })
         };
-        let kinds = |rows: &[RowKey]| rows.iter().map(|row| row.kind).collect::<Vec<_>>();
+        let written = |rows: &[RowKey]| -> Vec<usize> {
+            rows.iter()
+                .filter_map(|row| match row.kind {
+                    RowKind::Block {
+                        part,
+                        reasoning: false,
+                        ..
+                    } => Some(part),
+                    _ => None,
+                })
+                .collect()
+        };
+        let headers = |rows: &[RowKey]| -> Vec<usize> {
+            rows.iter()
+                .filter_map(|row| match row.kind {
+                    RowKind::Work { part, .. } => Some(part),
+                    _ => None,
+                })
+                .collect()
+        };
+        let tools = |rows: &[RowKey]| -> Vec<usize> {
+            rows.iter()
+                .filter_map(|row| match row.kind {
+                    RowKind::Tools { part, .. } => Some(part),
+                    _ => None,
+                })
+                .collect()
+        };
 
+        // Folded: a header, the narration, a header, the answer. No work.
         let folded = rows(&none, true);
-        assert_eq!(folded.len(), 2);
-        assert_eq!(folded[0].kind, RowKind::Work);
-        assert!(matches!(
-            folded[1].kind,
-            RowKind::Block {
-                part: 3,
-                reasoning: false,
-                ..
-            }
-        ));
+        let order: Vec<_> = folded
+            .iter()
+            .map(|row| matches!(row.kind, RowKind::Work { .. }))
+            .collect();
+        assert_eq!(order, [true, false, true, false]);
+        assert_eq!(headers(&folded), [0, 3]);
+        assert_eq!(written(&folded), [2, 5]);
+        assert!(tools(&folded).is_empty());
 
-        let shown = rows(&open, true);
-        assert!(shown.len() > folded.len());
-        assert_eq!(shown[0].kind, RowKind::Work);
+        // Opening the first run shows its call, and leaves the second folded.
+        let shown = rows(&first, true);
+        assert_eq!(headers(&shown), [0, 3]);
+        assert_eq!(written(&shown), [2, 5]);
+        assert_eq!(tools(&shown), [1]);
         assert_ne!(
             shown[0].version, folded[0].version,
             "opening remeasures the header"
         );
-        assert_eq!(kinds(&shown[shown.len() - 1..]), kinds(&folded[1..]));
-        assert!(shown
-            .iter()
-            .any(|row| matches!(row.kind, RowKind::Tools { .. })));
-        assert!(shown.iter().any(|row| matches!(
-            row.kind,
-            RowKind::Block {
-                reasoning: true,
-                ..
-            }
-        )));
 
         // Off, the same turn is the ordinary transcript, with no header.
-        assert!(rows(&none, false)
-            .iter()
-            .all(|row| row.kind != RowKind::Work));
+        let plain = rows(&none, false);
+        assert!(headers(&plain).is_empty());
+        assert_eq!(tools(&plain), [1, 3]);
+        assert_eq!(written(&plain), [2, 5]);
+    }
+
+    /// When a turn has several runs, each says what it did.
+    #[test]
+    fn a_run_is_named_by_what_it_did() {
+        let message = AgentChatMessage {
+            id: "a".into(),
+            role: Role::Assistant,
+            parts: vec![thinking(), probe("1"), probe("2")],
+        };
+        assert_eq!(run_label(&message, 0..1), "Thought");
+        assert_eq!(run_label(&message, 0..2), "1 tool call");
+        assert_eq!(run_label(&message, 0..3), "2 tool calls");
     }
 
     /// A turn with nothing but a reply has no work to fold.
@@ -1416,7 +1624,9 @@ mod tests {
                 open: &none,
             },
         );
-        assert!(rows.iter().all(|row| row.kind != RowKind::Work));
+        assert!(rows
+            .iter()
+            .all(|row| !matches!(row.kind, RowKind::Work { .. })));
     }
 
     #[test]

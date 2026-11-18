@@ -2160,3 +2160,95 @@ async fn a_claude_turn_places_its_steer_where_the_cli_took_it_and_checkpoints() 
         .expect("checkpoint at the head");
     assert_eq!(resumed.id, "native");
 }
+
+/// A stand-in for `agy`: `models` lists one, and `acp` runs one turn that
+/// calls Luma's `echo` through the tool server it was given. With a
+/// `signed-out` file beside it, it refuses to open a session, as the real CLI
+/// does when nobody is signed in.
+const FAKE_AGY: &str = r#"#!/usr/bin/env python3
+import json,sys,pathlib,urllib.request
+if sys.argv[1]=='models':
+    print('carbon-low\tCarbon (Low)\ncarbon-high\tCarbon (High)')
+    sys.exit()
+read=lambda: json.loads(sys.stdin.readline())
+def send(x): print(json.dumps(x),flush=True)
+assert read()['method']=='initialize'
+send({'jsonrpc':'2.0','id':1,'result':{}})
+new=read()
+if pathlib.Path(__file__).with_name('signed-out').exists():
+    send({'jsonrpc':'2.0','id':2,'error':{'code':-32000,'message':'Authentication required'}})
+    sys.exit()
+send({'jsonrpc':'2.0','id':2,'result':{'sessionId':'native','models':{'currentModelId':'carbon-low','availableModels':[{'modelId':'carbon-low'},{'modelId':'carbon-high'}]}}})
+model=read()
+assert model['params']['modelId']=='carbon-high', model
+send({'jsonrpc':'2.0','id':model['id'],'result':{}})
+prompt=read()
+assert prompt['method']=='session/prompt', prompt
+server=new['params']['mcpServers'][0]
+send({'jsonrpc':'2.0','id':'p','method':'session/request_permission','params':{
+    'toolCall':{'name':'mcp_luma_echo'},
+    'options':[{'optionId':'allow','kind':'allow_once'},{'optionId':'deny','kind':'reject_once'}]}})
+assert read()['result']['outcome']['optionId']=='allow'
+headers={h['name']:h['value'] for h in server['headers']}
+headers['Content-Type']='application/json'
+body=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'echo','arguments':{'value':'hi'}}}).encode()
+with urllib.request.urlopen(urllib.request.Request(server['url'],body,headers)) as response:
+    assert json.loads(response.read())['result']['isError']==False
+send({'jsonrpc':'2.0','method':'session/update','params':{'update':{
+    'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Dark now.'}}}})
+send({'jsonrpc':'2.0','id':prompt['id'],'result':{'stopReason':'end_turn','usage':{'inputTokens':10,'outputTokens':2}}})
+sys.stdin.readline()
+"#;
+
+/// A thread on Antigravity runs a turn whose tool call is Luma's own, and
+/// the turn's text and call are kept. When the CLI has no login the turn
+/// fails saying so, in words the chat offers a sign-in for.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_antigravity_turn_calls_lumas_tools_and_a_missing_login_asks_for_sign_in() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture().await;
+    let fake = fixture._dir.path().join("agy");
+    std::fs::write(&fake, FAKE_AGY).expect("fake agy");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::env::set_var("LUMA_AGY_EXECUTABLE", &fake);
+    sqlx::query("UPDATE agent_threads SET engine = 'antigravity', model = NULL WHERE id = ?")
+        .bind(&fixture.thread_id)
+        .execute(fixture.pool())
+        .await
+        .expect("antigravity thread");
+    let service = AgentService::new(fixture.services.clone())
+        .with_tools(ToolRegistry::new(vec![Arc::new(EchoTool)]));
+
+    let mut stream = service.turn(&fixture.thread_id, "make it dark".to_string().into());
+    let events = drain(&mut stream).await;
+    assert_eq!(
+        events.last(),
+        Some(&TurnEvent::TurnEnded {
+            outcome: TurnOutcome::Completed
+        }),
+        "{events:#?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::ToolCallEnded {
+            output: ToolResult::Output { .. },
+            ..
+        }
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, TurnEvent::TextDelta { text } if text == "Dark now.")));
+
+    std::fs::write(fixture._dir.path().join("signed-out"), "").expect("sign out");
+    let mut stream = service.turn(&fixture.thread_id, "darker".to_string().into());
+    let events = drain(&mut stream).await;
+    std::env::remove_var("LUMA_AGY_EXECUTABLE");
+    let Some(TurnEvent::TurnEnded {
+        outcome: TurnOutcome::Failed { message },
+    }) = events.last()
+    else {
+        panic!("{events:#?}")
+    };
+    assert!(super::engine::auth::signed_out(message), "{message}");
+}

@@ -35,6 +35,7 @@ pub mod tools;
 pub mod transcript;
 mod turn;
 
+pub use context::labels as turn_context_labels;
 pub use context::labels_of as context_labels;
 pub use context::{
     BarBeat, ClipSpan, CursorSpan, EditorClip, EditorCursor, EditorState, HandEdit, PerformView,
@@ -709,18 +710,81 @@ impl AgentService {
         &self,
         service: engine::catalog::Service,
     ) -> Result<Vec<engine::catalog::ModelChoice>, AgentError> {
-        match self.gateway_cache(service) {
-            Some((provider, cache)) => engine::catalog::refresh_gateway(provider, &cache).await,
-            None => engine::catalog::models(service, self.services.storage().path()).await,
+        if let Some((provider, cache)) = self.gateway_cache(service) {
+            return engine::catalog::refresh_gateway(provider, &cache).await;
+        }
+        let read = engine::catalog::models(service, self.services.storage().path()).await;
+        let Some(cache) = self.cli_cache(service) else {
+            return read;
+        };
+        match read {
+            Ok(models) => {
+                // A copy that cannot be saved costs the next launch its
+                // instant rows, not this read its list.
+                if let Err(error) = engine::catalog::save_choices(&cache, &models).await {
+                    eprintln!(
+                        "[models] could not save the {} list: {error}",
+                        service.label()
+                    );
+                }
+                Ok(models)
+            }
+            // A CLI that is slow or broken today still ran these yesterday. A
+            // missing login is not papered over: the list is the login's.
+            Err(error) if !engine::auth::signed_out(&error.to_string()) => {
+                engine::catalog::saved_choices(&cache).await.ok_or(error)
+            }
+            Err(error) => Err(error),
         }
     }
 
-    /// The gateway list [`Self::models`] saved last, or [`None`] for a service
-    /// that publishes none or has not been read yet.
+    /// Where a CLI service's model list is saved between launches, so the
+    /// picker has rows before the CLI has started.
+    fn cli_cache(&self, service: engine::catalog::Service) -> Option<std::path::PathBuf> {
+        let name = match service {
+            engine::catalog::Service::Claude => "claude-cli",
+            engine::catalog::Service::Codex => "codex-cli",
+            engine::catalog::Service::Antigravity => "antigravity-cli",
+            engine::catalog::Service::OpenRouter | engine::catalog::Service::Vercel => return None,
+        };
+        Some(self.services.storage().model_catalog_path(name))
+    }
+
+    /// Run `service`'s own sign-in, for a turn that failed because its CLI
+    /// has no login ([`engine::auth::signed_out`]). The CLI opens the browser;
+    /// this returns once the login is saved.
+    pub async fn sign_in(&self, service: engine::catalog::Service) -> Result<(), AgentError> {
+        engine::auth::sign_in(service, self.services.storage().path()).await
+    }
+
+    /// Every CLI service as Settings shows it: installed, signed in, used.
+    /// See [`engine::providers`].
+    pub async fn providers(&self) -> Vec<engine::providers::Provider> {
+        let cwd = self.services.storage().path();
+        futures_util::future::join_all(
+            engine::providers::services().map(|service| engine::providers::read(service, cwd)),
+        )
+        .await
+    }
+
+    /// How much of `service`'s subscription is used, or `None` for a service
+    /// that reports none. See [`engine::plan_usage`].
+    pub async fn plan_usage(
+        &self,
+        service: engine::catalog::Service,
+    ) -> Result<Option<engine::plan_usage::PlanUsage>, AgentError> {
+        engine::plan_usage::read(service, self.services.storage().path()).await
+    }
+
+    /// The list [`Self::models`] saved last, or [`None`] for a service that
+    /// has none or has not been read yet.
     pub async fn cached_models(
         &self,
         service: engine::catalog::Service,
     ) -> Option<Vec<engine::catalog::ModelChoice>> {
+        if let Some(cache) = self.cli_cache(service) {
+            return engine::catalog::saved_choices(&cache).await;
+        }
         let (provider, cache) = self.gateway_cache(service)?;
         engine::catalog::cached_gateway(provider, &cache).await
     }

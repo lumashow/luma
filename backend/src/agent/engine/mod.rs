@@ -1,12 +1,17 @@
 //! Session engines. API inference remains in `model`; CLI engines own their
 //! tool loop and return calls to the same Luma tool registry.
 
+mod antigravity;
+pub mod auth;
 pub mod catalog;
 pub(crate) mod claim;
 mod claude;
 mod claude_session;
 mod codex;
+mod mcp_http;
+pub mod plan_usage;
 mod process;
+pub mod providers;
 pub(crate) mod state;
 
 use super::{
@@ -33,6 +38,7 @@ pub enum Engine {
     Api,
     Codex,
     Claude,
+    Antigravity,
 }
 
 impl Engine {
@@ -40,6 +46,7 @@ impl Engine {
         ("api", "API"),
         ("codex", "Codex subscription"),
         ("claude", "Claude Code subscription"),
+        ("antigravity", "Antigravity subscription"),
     ];
 
     pub fn parse(value: &str) -> Result<Self, AgentError> {
@@ -47,6 +54,7 @@ impl Engine {
             "api" => Ok(Self::Api),
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
+            "antigravity" => Ok(Self::Antigravity),
             _ => Err(AgentError::Invalid(format!(
                 "unknown agent engine '{value}'"
             ))),
@@ -66,6 +74,7 @@ impl Engine {
             Self::Api => "api",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
         }
     }
 }
@@ -112,6 +121,7 @@ pub(super) enum Event {
 pub(super) enum Session {
     Codex(codex::Session),
     Claude(claude::Session),
+    Antigravity(antigravity::Session),
 }
 
 impl Session {
@@ -120,6 +130,7 @@ impl Session {
             let service = match request.engine {
                 Engine::Claude => catalog::Service::Claude,
                 Engine::Codex => catalog::Service::Codex,
+                Engine::Antigravity => catalog::Service::Antigravity,
                 Engine::Api => return Err(protocol("API engine has no subprocess")),
             };
             let models = catalog::models(service, &request.cwd).await?;
@@ -135,6 +146,9 @@ impl Session {
         match request.engine {
             Engine::Codex => codex::Session::start(request).await.map(Self::Codex),
             Engine::Claude => claude::Session::start(request).await.map(Self::Claude),
+            Engine::Antigravity => antigravity::Session::start(request)
+                .await
+                .map(Self::Antigravity),
             Engine::Api => Err(AgentError::Invalid("API engine has no subprocess".into())),
         }
     }
@@ -143,6 +157,7 @@ impl Session {
         match self {
             Self::Codex(s) => s.next().await,
             Self::Claude(s) => s.next().await,
+            Self::Antigravity(s) => s.next().await,
         }
     }
 
@@ -150,13 +165,14 @@ impl Session {
         match self {
             Self::Codex(session) => (session.last_usage, session.context_window),
             Self::Claude(session) => (session.last_usage, session.context_window),
+            Self::Antigravity(session) => (session.last_usage, session.context_window),
         }
     }
 
     pub fn usage_total(&self) -> Usage {
         match self {
             Self::Codex(s) => s.usage_total(),
-            Self::Claude(_) => Usage::default(),
+            Self::Claude(_) | Self::Antigravity(_) => Usage::default(),
         }
     }
 
@@ -164,20 +180,16 @@ impl Session {
         match self {
             Self::Codex(session) => Steerer::Codex(session.steerer()),
             Self::Claude(session) => Steerer::Claude(session.steerer()),
+            Self::Antigravity(session) => Steerer::Antigravity(session.steerer()),
         }
     }
 
     pub fn replier(&self) -> Replier {
-        match self {
-            Self::Codex(session) => Replier {
-                engine: Engine::Codex,
-                input: session.input(),
-            },
-            Self::Claude(session) => Replier {
-                engine: Engine::Claude,
-                input: session.input(),
-            },
-        }
+        Replier(match self {
+            Self::Codex(session) => Reply::Codex(session.input()),
+            Self::Claude(session) => Reply::Claude(session.input()),
+            Self::Antigravity(session) => Reply::Antigravity(session.replies()),
+        })
     }
 }
 
@@ -186,6 +198,7 @@ impl Session {
 pub(super) enum Steerer {
     Codex(codex::Steerer),
     Claude(claude::Steerer),
+    Antigravity(antigravity::Steerer),
 }
 
 impl Steerer {
@@ -202,23 +215,31 @@ impl Steerer {
         match self {
             Self::Codex(steerer) => steerer.steer(id, blocks).await,
             Self::Claude(steerer) => steerer.steer(id, blocks, tools_open).await,
+            Self::Antigravity(steerer) => {
+                steerer.steer(id, blocks);
+                Ok(())
+            }
         }
     }
 }
 
-pub(super) struct Replier {
-    engine: Engine,
-    input: process::Input,
+/// Hands a tool's result back to the session that called it: a frame on the
+/// CLI's stdin, or the answer to the call a CLI made over HTTP.
+pub(super) struct Replier(Reply);
+
+enum Reply {
+    Codex(process::Input),
+    Claude(process::Input),
+    Antigravity(mcp_http::Replies),
 }
 
 impl Replier {
     pub async fn reply(&self, id: Value, outcome: ToolOutcome) -> Result<(), AgentError> {
-        let frame = match self.engine {
-            Engine::Codex => codex::reply_frame(id, outcome),
-            Engine::Claude => claude::reply_frame(id, outcome),
-            Engine::Api => unreachable!("API has no native session"),
-        };
-        self.input.send(frame).await
+        match &self.0 {
+            Reply::Codex(input) => input.send(codex::reply_frame(id, outcome)).await,
+            Reply::Claude(input) => input.send(claude::reply_frame(id, outcome)).await,
+            Reply::Antigravity(replies) => replies.reply(&id, outcome),
+        }
     }
 }
 
@@ -252,7 +273,7 @@ pub(super) fn hydrate_session(
             claude_session::hydrate(transcript, turn_message_id, registry, model, cwd)
                 .map(Hydration::Session)
         }
-        Engine::Codex => Ok(Hydration::Unsupported),
+        Engine::Codex | Engine::Antigravity => Ok(Hydration::Unsupported),
         Engine::Api => unreachable!("API execution has no native session"),
     }
 }

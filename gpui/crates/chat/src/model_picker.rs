@@ -19,6 +19,7 @@ use gpui::{
 use gpui_component::{tooltip::Tooltip, Icon};
 use luma_lib::agent::{
     engine::catalog::{ModelChoice, Selection, Service},
+    engine::plan_usage::{self, PlanUsage},
     model::MODELS,
 };
 use luma_ui::{
@@ -48,10 +49,13 @@ const INSET: f32 = 4.;
 /// on one edge with the rows' text.
 const TEXT_INSET: f32 = 8.;
 const SLIDER_WIDTH: f32 = CARD_WIDTH - 2. * (INSET + TEXT_INSET);
-/// The slider's knob, and the thinner track it rides.
-const KNOB: f32 = 24.;
-const TRACK: f32 = 18.;
-const TRACK_TOP: f32 = (KNOB - TRACK) / 2.;
+/// How long a CLI's model list is taken as read before the picker asks the
+/// CLI again. Zeron's cooldown.
+const CLI_REREAD: std::time::Duration = std::time::Duration::from_secs(60);
+/// The slider's hit area, and the shorter well drawn inside it.
+const SLIDER_HEIGHT: f32 = 24.;
+const WELL: f32 = 18.;
+const WELL_TOP: f32 = (SLIDER_HEIGHT - WELL) / 2.;
 /// The panel's title block: the level over the model, or the model alone.
 const TITLE_HEIGHT: f32 = 48.;
 const TITLE_HEIGHT_SINGLE: f32 = 36.;
@@ -117,10 +121,15 @@ pub struct ModelPicker {
     /// The slider's level while it is dragged or stepped, ahead of the save.
     preview: Option<f32>,
     dragging: bool,
+    /// When each service's list was last asked for.
+    read_at: HashMap<Service, Instant>,
     thumb: RefCell<Tween>,
     height: RefCell<Tween>,
     catalogs: HashMap<Service, Result<Vec<ModelChoice>, String>>,
     loading: HashSet<Service>,
+    /// How much of each subscription is used, as last read: `None` for a
+    /// read that failed, and no entry until the first read lands.
+    usage: HashMap<Service, Option<PlanUsage>>,
     /// The services whose list saved on disk has been looked for, found or
     /// not: past that, the chip's label changes only when a fresh read lands.
     looked_up: HashSet<Service>,
@@ -171,10 +180,12 @@ impl ModelPicker {
                 expanded: false,
                 preview: None,
                 dragging: false,
+                read_at: HashMap::new(),
                 thumb: RefCell::new(Tween::default()),
                 height: RefCell::new(Tween::default()),
                 catalogs: HashMap::new(),
                 loading: HashSet::new(),
+                usage: HashMap::new(),
                 looked_up: HashSet::new(),
                 search,
                 _search: subscription,
@@ -229,17 +240,25 @@ impl ModelPicker {
         cx.notify();
     }
 
-    /// Read `service`'s models if needed. A gateway's list is read again
-    /// every time — the models page asks each time it opens — and the rows
-    /// already held, or saved on disk, show while it is on the wire, so the
-    /// list is never blank while it refreshes. A CLI's list is read once per
-    /// session: asking means starting the CLI.
+    /// Read `service`'s models. The list is read again each time it is
+    /// asked for — the picker asks each time it opens — and the rows already
+    /// held, or saved on disk from the last launch, show while it is read,
+    /// so the list is never blank while it refreshes. A CLI's list is not
+    /// read twice within [`CLI_REREAD`]: asking means starting the CLI.
     pub(crate) fn browse(&mut self, service: Service, cx: &mut gpui::Context<Self>) {
+        self.read_usage(service, cx);
         let held = matches!(self.catalogs.get(&service), Some(Ok(_)));
-        if (held && !service.lists_models()) || !self.loading.insert(service) {
+        let fresh = held
+            && !service.lists_models()
+            && self
+                .read_at
+                .get(&service)
+                .is_some_and(|at| at.elapsed() < CLI_REREAD);
+        if fresh || !self.loading.insert(service) {
             cx.notify();
             return;
         }
+        self.read_at.insert(service, Instant::now());
         if !held {
             // A previous error, cleared so the retry reads as loading.
             self.catalogs.remove(&service);
@@ -270,6 +289,35 @@ impl ModelPicker {
                 this.loading.remove(&service);
                 this.receive(service, result, cx);
                 this.changed(chip, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Read how much of `service`'s subscription is used, for the panel's
+    /// usage line. Only a service that reports usage is asked, and its line
+    /// has its place on the panel from the start, so a reading that lands
+    /// changes the words and never the card's height.
+    fn read_usage(&mut self, service: Service, cx: &mut gpui::Context<Self>) {
+        if !plan_usage::reported_by(service) {
+            return;
+        }
+        let pending = self.agent.plan_usage(service);
+        cx.spawn(async move |this, cx| {
+            let usage = match pending.await {
+                Ok(usage) => usage,
+                Err(error) => {
+                    eprintln!("[agent] {} usage unavailable: {error}", service.label());
+                    None
+                }
+            };
+            this.update(cx, |this, cx| {
+                // A failed read keeps the last reading.
+                if usage.is_some() || !matches!(this.usage.get(&service), Some(Some(_))) {
+                    this.usage.insert(service, usage);
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -538,9 +586,12 @@ impl ModelPicker {
             return;
         };
         let levels = self.efforts(&selection);
-        let Some(level) = levels.get(effort_index(fraction, levels.len())) else {
+        let index = effort_index(fraction, levels.len());
+        let Some(level) = levels.get(index) else {
             return;
         };
+        // The drag followed the pointer; letting go settles on the level.
+        self.preview = Some(index as f32 / levels.len().saturating_sub(1).max(1) as f32);
         selection.effort = Some(level.clone());
         self.save(selection, cx);
         cx.notify();
@@ -569,8 +620,26 @@ impl ModelPicker {
             "left" => index.saturating_sub(1),
             _ => (index + 1).min(levels.len() - 1),
         };
-        self.preview = Some(next as f32 / (levels.len() - 1) as f32);
+        self.preview_level(next as f32 / (levels.len() - 1) as f32);
         self.commit_effort(cx);
+    }
+
+    /// Show the level at `fraction` on the slider, ahead of its save. Landing
+    /// on another level is a detent: the trackpad taps, once per level
+    /// crossed, whether a drag, a press or a key moved it.
+    fn preview_level(&mut self, fraction: f32) {
+        let Some(selection) = self.shown() else {
+            return;
+        };
+        let levels = self.efforts(&selection);
+        let shown = self
+            .preview
+            .map(|fraction| effort_index(fraction, levels.len()))
+            .unwrap_or_else(|| self.level_index(&selection, &levels));
+        if effort_index(fraction, levels.len()) != shown {
+            luma_ui::haptics::selection_step();
+        }
+        self.preview = Some(fraction);
     }
 
     /// `selection` with the model it runs: one that names none runs its
@@ -872,7 +941,12 @@ impl ModelPicker {
                     .text_size(px(TITLE_SIZE))
                     .line_height(px(18.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(level.clone())
+                    // The level's name rolls to the next as the slider moves.
+                    .child(luma_ui::roll_text::roll_text(
+                        "model-effort-level",
+                        level.clone().into(),
+                        motion::reduced_motion(cx),
+                    ))
                     .agent_node(Role::Text, format!("Effort · {level}"))
             }))
             .child(
@@ -920,9 +994,11 @@ impl ModelPicker {
                     .child(title),
             )
             .when(!levels.is_empty(), |el| {
+                // Under the pointer while it drags; gliding to a level
+                // otherwise.
                 let shown = self.thumb.borrow_mut().sample(
                     fraction,
-                    motion::reduced_motion(cx),
+                    self.dragging || motion::reduced_motion(cx),
                     &motion::TAB_SLIDE,
                     window,
                 );
@@ -932,6 +1008,23 @@ impl ModelPicker {
                         .pt(px(8.))
                         .pb(px(10.))
                         .child(slider(shown, levels.len(), disabled, &cx.entity())),
+                )
+            })
+            .when(plan_usage::reported_by(selection.service), |el| {
+                let text = match self.usage.get(&selection.service) {
+                    Some(Some(usage)) => usage_text(usage, selection.model.as_deref()),
+                    Some(None) => "Usage unavailable".to_string(),
+                    None => "Reading usage…".to_string(),
+                };
+                el.child(
+                    div()
+                        .px(px(TEXT_INSET))
+                        .pb(px(8.))
+                        .text_size(px(11.5))
+                        .line_height(px(14.))
+                        .text_color(ladder::muted_foreground())
+                        .child(text.clone())
+                        .agent_node(Role::Text, format!("Plan usage · {text}")),
                 )
             })
             .into_any_element()
@@ -1212,76 +1305,30 @@ fn square(id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
         .cursor_pointer()
 }
 
-/// The reasoning slider, as it was before the picker followed Zeron: a thin
-/// track, a notch per level, a round white knob, and the fill in the effort's
-/// colour (blue, turning to a violet gradient at the top levels).
+/// The reasoning slider: [`luma_ui::slider::detent_fader`], in the effort's
+/// colour (blue, violet at the top levels). A drag follows the pointer, and
+/// settles on the nearest level when it lets go.
 fn slider(fraction: f32, count: usize, disabled: bool, this: &Entity<ModelPicker>) -> AnyElement {
-    let travel = SLIDER_WIDTH - KNOB;
-    let left = fraction * travel;
     let (bounds, probe) = luma_ui::arg::bounds_probe();
     let down = this.clone();
     let up = this.clone();
     let outside = this.clone();
     let moving = this.clone();
-    let fill = if fraction > 0.75 {
-        gpui::linear_gradient(
-            90.,
-            gpui::linear_color_stop(rgb(0x4244df), 0.),
-            gpui::linear_color_stop(rgb(0xab79ef), 1.),
-        )
-    } else {
-        gpui::Background::from(effort_color(fraction))
-    };
+    let level = effort_index(fraction, count) as f32 / count.saturating_sub(1).max(1) as f32;
     div()
         .id("effort-slider")
         .relative()
         .w(px(SLIDER_WIDTH))
-        .h(px(KNOB))
+        .h(px(SLIDER_HEIGHT))
         .cursor_pointer()
         .child(probe)
         .child(
-            div()
+            luma_ui::slider::detent_fader(fraction, count, effort_color(level))
                 .absolute()
                 .left_0()
                 .right_0()
-                .top(px(TRACK_TOP))
-                .h(px(TRACK))
-                .rounded_full()
-                .bg(ladder::foreground_alpha(0.12)),
-        )
-        .child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(TRACK_TOP))
-                // At least the track's height, so the fill's rounded end is
-                // the track's own and stays inside the knob. Narrower, its
-                // corners tightened and peeked out past the knob's curve at
-                // the lowest level.
-                .w(px((left + KNOB / 2.).max(TRACK)))
-                .h(px(TRACK))
-                .rounded_full()
-                .bg(fill),
-        )
-        .children((0..count).map(|index| {
-            div()
-                .absolute()
-                .left(px(
-                    KNOB / 2. + travel * index as f32 / (count - 1) as f32 - 2.
-                ))
-                .top(px(KNOB / 2. - 2.))
-                .size(px(4.))
-                .rounded_full()
-                .bg(ladder::foreground_alpha(0.3))
-        }))
-        .child(
-            div()
-                .absolute()
-                .left(px(left))
-                .top_0()
-                .size(px(KNOB))
-                .rounded_full()
-                .bg(rgb(0xffffff)),
+                .top(px(WELL_TOP))
+                .h(px(WELL)),
         )
         .child(
             gpui::canvas(
@@ -1292,10 +1339,9 @@ fn slider(fraction: f32, count: usize, disabled: bool, this: &Entity<ModelPicker
                         if phase == gpui::DispatchPhase::Bubble {
                             moving.update(cx, |picker, cx| {
                                 if picker.dragging {
-                                    picker.preview = Some(snapped_fraction(
+                                    picker.preview_level(luma_ui::slider::detent_fraction(
                                         f32::from(event.position.x - bounds.left()),
                                         f32::from(bounds.size.width),
-                                        count,
                                     ));
                                     cx.notify();
                                 }
@@ -1314,10 +1360,9 @@ fn slider(fraction: f32, count: usize, disabled: bool, this: &Entity<ModelPicker
             if let Some(bounds) = bounds.get() {
                 down.update(cx, |picker, cx| {
                     picker.dragging = true;
-                    picker.preview = Some(snapped_fraction(
+                    picker.preview_level(luma_ui::slider::detent_fraction(
                         f32::from(event.position.x - bounds.left()),
                         f32::from(bounds.size.width),
-                        count,
                     ));
                     cx.notify();
                 });
@@ -1333,14 +1378,6 @@ fn slider(fraction: f32, count: usize, disabled: bool, this: &Entity<ModelPicker
         .agent_node(Role::Slider, "Reasoning effort")
         .agent_disabled(disabled)
         .into_any_element()
-}
-
-/// The level a pointer `x` across the slider's `width` asks for, as the
-/// fraction that level sits at: the notches and the pointer share the knob's
-/// centre inset, so a press on a notch takes that notch.
-fn snapped_fraction(x: f32, width: f32, count: usize) -> f32 {
-    let fraction = ((x - KNOB / 2.) / (width - KNOB).max(1.)).clamp(0., 1.);
-    effort_index(fraction, count) as f32 / count.saturating_sub(1).max(1) as f32
 }
 
 fn effort_color(fraction: f32) -> gpui::Hsla {
@@ -1405,6 +1442,17 @@ fn matches(row: &Row, query: &str) -> bool {
         .all(|word| haystack.contains(&word.to_lowercase()))
 }
 
+/// A subscription's usage as the panel says it, for the model chosen:
+/// `Session 42% · Week 17%`.
+fn usage_text(usage: &PlanUsage, model: Option<&str>) -> String {
+    let windows: Vec<_> = usage
+        .for_model(model)
+        .into_iter()
+        .map(|window| format!("{} {}%", window.label, (window.used * 100.).round()))
+        .collect();
+    windows.join(" · ")
+}
+
 /// A row's tooltip line: its window and its price per million tokens, as
 /// far as its list says.
 fn detail(model: &ModelChoice) -> Option<String> {
@@ -1460,12 +1508,15 @@ const KIMI: &[u8] = include_bytes!("../assets/services/kimi.svg");
 const GROK: &[u8] = include_bytes!("../assets/services/grok.svg");
 const OPENROUTER: &[u8] = include_bytes!("../assets/services/openrouter.svg");
 const VERCEL: &[u8] = include_bytes!("../assets/services/vercel.svg");
+const ANTIGRAVITY: &[u8] = include_bytes!("../assets/services/antigravity.svg");
+const GEMINI: &[u8] = include_bytes!("../assets/services/gemini.svg");
 
 /// A service's own mark, one ink: a tab's glyph.
 fn service_logo(service: Service) -> gpui::Svg {
     let data = match service {
         Service::Claude => CLAUDE,
         Service::Codex => OPENAI,
+        Service::Antigravity => ANTIGRAVITY,
         Service::OpenRouter => OPENROUTER,
         Service::Vercel => VERCEL,
     };
@@ -1485,6 +1536,10 @@ fn model_logo(service: Service, model: Option<&str>) -> gpui::Svg {
             (GROK, ladder::foreground().into())
         } else if model.contains("gpt") || service == Service::Codex {
             (OPENAI, rgb(0x10a37f).into())
+        } else if model.contains("gemini") {
+            (GEMINI, rgb(0x4285f4).into())
+        } else if service == Service::Antigravity {
+            (ANTIGRAVITY, ladder::foreground().into())
         } else if service == Service::Vercel {
             (VERCEL, ladder::foreground().into())
         } else {
@@ -1601,20 +1656,6 @@ mod tests {
         assert!(matches(&row(model(None)), "openai/"));
         assert!(matches(&row(model(None)), "openrouter sol"));
         assert!(!matches(&row(model(None)), "kimi"));
-    }
-
-    #[test]
-    fn pointer_selects_discrete_ticks_and_clamps_outside_track() {
-        for count in 2..8 {
-            for x in -20..260 {
-                let value = snapped_fraction(x as f32, SLIDER_WIDTH, count);
-                let tick = value * (count - 1) as f32;
-                assert!((tick - tick.round()).abs() < 0.0001);
-                assert!((0.0..=1.0).contains(&value));
-            }
-        }
-        assert_eq!(snapped_fraction(-20., SLIDER_WIDTH, 4), 0.);
-        assert_eq!(snapped_fraction(260., SLIDER_WIDTH, 4), 1.);
     }
 
     #[test]

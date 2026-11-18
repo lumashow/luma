@@ -67,6 +67,8 @@ use gpui::{
 use gpui_component::Icon;
 use luma_lib::agent::{
     engine::catalog::{ModelChoice, Selection, Service},
+    engine::plan_usage::PlanUsage,
+    engine::providers::Provider,
     AgentService, ThreadScope, Transcript, TurnContext, TurnEvent, TurnOutcome, UserPrompt,
 };
 use luma_lib::database::local::feedback::{Feedback, Target, Verdict};
@@ -200,6 +202,40 @@ impl Agent {
         let task = self
             .runtime
             .spawn(async move { agent.models(service).await.map_err(|e| e.to_string()) });
+        async move { task.await.map_err(|e| e.to_string())? }
+    }
+
+    /// Every CLI service as Settings shows it — see
+    /// [`luma_lib::agent::AgentService::providers`].
+    pub fn providers(&self) -> impl std::future::Future<Output = Vec<Provider>> + use<> {
+        let agent = self.service.clone();
+        let task = self.runtime.spawn(async move { agent.providers().await });
+        async move { task.await.unwrap_or_default() }
+    }
+
+    /// How much of `service`'s subscription is used — see
+    /// [`luma_lib::agent::AgentService::plan_usage`].
+    pub fn plan_usage(
+        &self,
+        service: Service,
+    ) -> impl std::future::Future<Output = Result<Option<PlanUsage>, String>> + use<> {
+        let agent = self.service.clone();
+        let task = self
+            .runtime
+            .spawn(async move { agent.plan_usage(service).await.map_err(|e| e.to_string()) });
+        async move { task.await.map_err(|e| e.to_string())? }
+    }
+
+    /// Run `service`'s own sign-in — see
+    /// [`luma_lib::agent::AgentService::sign_in`].
+    pub fn sign_in(
+        &self,
+        service: Service,
+    ) -> impl std::future::Future<Output = Result<(), String>> + use<> {
+        let agent = self.service.clone();
+        let task = self
+            .runtime
+            .spawn(async move { agent.sign_in(service).await.map_err(|e| e.to_string()) });
         async move { task.await.map_err(|e| e.to_string())? }
     }
 
@@ -414,6 +450,14 @@ pub struct AgentChat {
     list_took_input: bool,
     spring: transcript::StickSpring,
     send_motion: send_motion::SendMotion,
+    /// Where the left button went down in the transcript, until it moves far
+    /// enough to be a drag or comes back up.
+    press: Option<gpui::Point<gpui::Pixels>>,
+    /// What was left typed in each conversation the reader has been away
+    /// from, by thread id. Kept for the panel's life, not stored.
+    drafts: HashMap<String, String>,
+    /// Whether the jump-to-latest button is showing.
+    adrift: bool,
     composer_bounds: Rc<Cell<gpui::Bounds<gpui::Pixels>>>,
     plate_bounds: Rc<Cell<gpui::Bounds<gpui::Pixels>>>,
     /// Last tick's wall clock, for the elapsed-frames conversion, and last
@@ -473,6 +517,8 @@ pub struct AgentChat {
     trailer_row: Option<usize>,
     /// What went wrong, in the panel's own words. Cleared by the next send.
     error: Option<String>,
+    /// The service's own sign-in is running, in the reader's browser.
+    signing_in: bool,
     /// A stop the reader asked for is being written. Until it lands, the
     /// stopped turn reads as unfinished, and the panel must not offer to
     /// resume what the reader just stopped.
@@ -481,8 +527,11 @@ pub struct AgentChat {
     /// Keyed by the call rather than by row index so a chip keeps its state
     /// while rows arrive above it.
     expanded: HashSet<SharedString>,
-    /// Compact turns the reader has opened, by message id.
+    /// The runs of compact turns' work the reader has opened, by
+    /// [`transcript::work_key`].
     open_work: HashSet<SharedString>,
+    /// The long prompts the reader has opened, by row key.
+    open_prompts: HashSet<SharedString>,
     /// The reader's verdicts on the shown thread's turns, by the id of the
     /// user message that started each one.
     verdicts: HashMap<SharedString, Verdict>,
@@ -496,10 +545,21 @@ pub struct AgentChat {
     /// Markdown rows the list laid out since the last frame's trim; see
     /// [`transcript::Viewed`].
     viewed: transcript::Viewed,
-    /// The one fold in flight: which call was clicked, when, and which row it
-    /// is in so the tween can remeasure it. At most one — a fold is started by
-    /// a click, and a click lands on one chip.
-    fold: Option<(SharedString, std::time::Instant, usize)>,
+    /// The one fold in flight: which call was clicked, when its tween
+    /// started, which row it is in so the tween can remeasure it, and how
+    /// open its card was at the click. At most one — a fold is started by a
+    /// click, and a click lands on one chip.
+    ///
+    /// The tween starts on the first frame after the click, not at the
+    /// click: that frame lays the card out at the height it had, which is
+    /// what lets the send room measure it before it moves (see
+    /// [`send_motion::SendMotion::room_with_fold`]).
+    ///
+    /// It ends the same way: one frame laid out at the card's final height
+    /// while still counted as folding (`landed`), so the room takes the last
+    /// step in the layout that makes it.
+    fold: Option<(SharedString, Option<std::time::Instant>, usize, f32)>,
+    fold_landed: bool,
     /// The folding row, and where its top sat on screen when it was clicked.
     /// Outlives [`Self::fold`] by one layout, the one that settles it.
     fold_hold: Option<(usize, f32)>,
@@ -562,6 +622,9 @@ impl AgentChat {
             list_took_input: false,
             spring: transcript::StickSpring::default(),
             send_motion: send_motion::SendMotion::default(),
+            press: None,
+            drafts: HashMap::new(),
+            adrift: false,
             composer_bounds: Rc::default(),
             plate_bounds: Rc::default(),
             spring_tick: None,
@@ -584,8 +647,10 @@ impl AgentChat {
             turn: None,
             trailer_row: None,
             error: None,
+            signing_in: false,
             expanded: HashSet::new(),
             open_work: HashSet::new(),
+            open_prompts: HashSet::new(),
             verdicts: HashMap::new(),
             compact: false,
             cells: RefCell::default(),
@@ -593,6 +658,7 @@ impl AgentChat {
             fold: None,
             fold_hold: None,
             fold_px: Cell::new(0.0),
+            fold_landed: false,
             focus: cx.focus_handle(),
             theme: Theme::dark(),
         };
@@ -682,6 +748,42 @@ impl AgentChat {
         &self.model_picker
     }
 
+    /// The service whose sign-in would fix the error on show: a turn on a
+    /// CLI service failed because that CLI has no login.
+    fn sign_in_offer(&self) -> Option<Service> {
+        let service = self.selection.as_ref()?.service;
+        let signed_out = self
+            .error
+            .as_deref()
+            .is_some_and(luma_lib::agent::engine::auth::signed_out);
+        (signed_out && service.provider().is_none()).then_some(service)
+    }
+
+    /// Run the service's own sign-in. The failed turn is not sent again: the
+    /// error clears and the reader resumes or sends when they are ready.
+    fn sign_in(&mut self, cx: &mut Context<Self>) {
+        let Some(service) = self.sign_in_offer().filter(|_| !self.signing_in) else {
+            return;
+        };
+        self.signing_in = true;
+        let read = self.reads;
+        let pending = self.agent.sign_in(service);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = pending.await;
+            this.update(cx, |this, cx| {
+                if this.reads != read {
+                    return;
+                }
+                this.signing_in = false;
+                this.error = result.err();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn select_model(&mut self, selection: Selection, cx: &mut Context<Self>) {
         if self.is_streaming() {
             return;
@@ -749,6 +851,16 @@ impl AgentChat {
     /// conversation is arriving" is stated once rather than at each of the
     /// three call sites.
     fn begin_read(&mut self, cx: &mut Context<Self>) -> u64 {
+        // What was being typed stays with the conversation it was typed in.
+        if let Conversation::Open(thread) = &self.conversation {
+            let draft = self.composer.draft(cx);
+            if draft.is_empty() {
+                self.drafts.remove(thread);
+            } else {
+                self.drafts.insert(thread.clone(), draft);
+            }
+            self.composer.clear(cx);
+        }
         self.reads += 1;
         self.conversation = Conversation::Loading(self.reads);
         self.selection = None;
@@ -756,6 +868,7 @@ impl AgentChat {
         self.selection_saving = false;
         self.queued_selection = None;
         self.error = None;
+        self.signing_in = false;
         self.verdicts.clear();
         self.seat(Transcript::default(), cx);
         self.reads
@@ -811,18 +924,16 @@ impl AgentChat {
         transcript::rows_for(&self.transcript, &self.entries, live, compact)
     }
 
-    /// Open or close one compact turn's work.
+    /// Open or close one run of a compact turn's work, named by its
+    /// [`transcript::work_key`].
     ///
     /// The header's top is held where the reader clicked it, as for a chip's
     /// fold: the rows that appear or vanish are below it.
-    pub fn toggle_work(&mut self, message_id: SharedString, row: usize, cx: &mut Context<Self>) {
-        if !self.open_work.remove(&message_id) {
-            self.open_work.insert(message_id);
+    pub fn toggle_work(&mut self, run: SharedString, row: usize, cx: &mut Context<Self>) {
+        if !self.open_work.remove(&run) {
+            self.open_work.insert(run);
         }
-        self.fold_hold = self
-            .list
-            .bounds_for_item(row)
-            .map(|bounds| (row, f32::from(bounds.top())));
+        self.hold_for_fold(row);
         self.reconcile_rows();
         cx.notify();
     }
@@ -867,15 +978,20 @@ impl AgentChat {
         }
     }
 
-    fn start_send_motion(&mut self, text: String, cx: &mut Context<Self>) {
+    fn start_send_motion(&mut self, prompt: &UserPrompt, cx: &mut Context<Self>) {
+        let attached = prompt
+            .context
+            .as_ref()
+            .map(|context| luma_lib::agent::turn_context_labels(context).join("  ·  "))
+            .unwrap_or_default();
         self.send_motion.start(
-            text,
-            f32::from(self.composer_bounds.get().top()),
+            prompt.text.clone(),
+            attached,
             luma_ui::motion::reduced_motion(cx),
         );
         self.reconcile_rows();
         // Bring an offscreen append into the measured range before the spring
-        // lifts it. Its visible copy still starts at the composer.
+        // lifts it.
         self.list
             .scroll_to_reveal_item(self.rows.len() + self.send_motion.pending.len() - 1);
         self.pinned = true;
@@ -905,7 +1021,7 @@ impl AgentChat {
     /// under — the one exchange whose height the room depends on.
     fn fold_in_turn(&self) -> bool {
         match (&self.fold, self.anchor_row()) {
-            (Some((_, _, row)), Some(anchor)) => *row > anchor,
+            (Some((_, _, row, _)), Some(anchor)) => *row > anchor,
             _ => false,
         }
     }
@@ -922,9 +1038,8 @@ impl AgentChat {
         }
     }
 
-    /// Read this frame's layout, consume reserved room, then advance the
-    /// message toward its moving on-screen destination with the shared spring.
-    fn step_send_motion(&mut self, reduced: bool) {
+    /// Read this frame's layout and consume reserved room.
+    fn step_send_motion(&mut self) {
         let viewport = self.list.viewport_bounds();
         let scroll = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
         let anchor = self.anchor_row();
@@ -932,7 +1047,6 @@ impl AgentChat {
             self.send_motion.anchor_offset =
                 Some(f32::from(bounds.top() - viewport.top()) + scroll);
         }
-        let old_room = self.send_motion.room;
         if let Some(offset) = self.send_motion.anchor_offset {
             let end = self.rows.len() + self.send_motion.pending.len();
             if let Some(bounds) = end
@@ -953,34 +1067,6 @@ impl AgentChat {
                 if (room - self.send_motion.room).abs() > 0.5 {
                     self.send_motion.room = room;
                     self.list.remeasure_items(end..end + 1);
-                }
-            }
-        }
-
-        if let Some(flight) = &mut self.send_motion.flight {
-            if let Some(top) = anchor
-                .and_then(|ix| self.list.bounds_for_item(ix))
-                .map(|bounds| f32::from(bounds.top()))
-                .or_else(|| {
-                    self.send_motion
-                        .anchor_offset
-                        .map(|offset| f32::from(viewport.top()) + offset - scroll)
-                })
-            {
-                let gap =
-                    anchor
-                        .filter(|ix| *ix < self.rows.len())
-                        .map_or(theme::GAP_BLOCK, |ix| {
-                            transcript::top_gap_for(
-                                ix.checked_sub(1).and_then(|prev| self.rows.get(prev)),
-                                &self.rows[ix],
-                            )
-                        });
-                if flight.step(top + gap, reduced)
-                    && old_room == self.send_motion.room
-                    && self.spring.is_idle()
-                {
-                    self.send_motion.flight = None;
                 }
             }
         }
@@ -1007,7 +1093,14 @@ impl AgentChat {
         list.set_scroll_handler(move |_, _, cx| {
             // Synchronously: only the chat's own flag is touched, not the
             // list, whose `RefCell` borrow is still held here.
-            chat.update(cx, |this, _| this.list_took_input = true).ok();
+            // The reader's own scroll also ends a fold's hold on its row:
+            // holding the row where it was clicked would undo the scroll on
+            // every frame of the fold.
+            chat.update(cx, |this, _| {
+                this.list_took_input = true;
+                this.fold_hold = None;
+            })
+            .ok();
             // Reading the list back is another matter: defer that to after it
             // has let go.
             let chat = chat.clone();
@@ -1015,8 +1108,8 @@ impl AgentChat {
                 chat.update(cx, |this, cx| {
                     this.list_took_input = false;
                     let escaped = std::mem::take(&mut this.input_escaped);
-                    // A deliberate reader scroll ends the send flight.
-                    this.send_motion.flight = None;
+                    // A deliberate reader scroll ends the send's glide.
+                    this.send_motion.glide = false;
                     let distance = this.distance_from_bottom();
                     let previous = std::mem::replace(&mut this.distance, distance);
                     let pinned =
@@ -1082,7 +1175,7 @@ impl AgentChat {
             distance = glide_max;
         }
         let pos = target - distance;
-        let rate = if self.send_motion.flight.is_some() {
+        let rate = if self.send_motion.glide {
             send_motion::SCROLL_RATE
         } else {
             1.0
@@ -1201,6 +1294,9 @@ impl AgentChat {
                         .map(|live| (live.since, live.transcript.clone()));
                     if !self.read_only {
                         cx.emit(ChatEvent::FeedbackRequested(detail.thread.id.clone()));
+                    }
+                    if let Some(draft) = self.drafts.remove(&detail.thread.id) {
+                        self.composer.restore(&draft, cx);
                     }
                     self.conversation = Conversation::Open(detail.thread.id);
                     match live {
@@ -1375,13 +1471,15 @@ impl AgentChat {
         self.turn.is_some()
     }
 
-    /// Dismiss the model picker first; otherwise stop a running turn.
+    /// Dismiss the model picker first; otherwise stop a running turn, unless
+    /// the reader turned that off.
     pub fn escape(&mut self, cx: &mut Context<Self>) {
         if self.model_picker.read(cx).open {
             self.model_picker.update(cx, |picker, cx| picker.close(cx));
             return;
         }
-        if self.is_streaming() {
+        let stops = cx.try_global::<EscapeStopsTurn>().is_none_or(|flag| flag.0);
+        if stops && self.is_streaming() {
             self.cancel(cx);
         }
     }
@@ -1392,26 +1490,58 @@ impl AgentChat {
     /// streamed delta does: the height that changed is one row's, and
     /// remeasuring the list is the frame budget.
     ///
-    /// Nothing above the chip may move while it folds. The press that clicked
-    /// it already released the bottom pin (see the transcript's mouse-down);
-    /// the send room takes the card's change in the same layout (see
+    /// Nothing above the chip may move while it folds. The fold releases the
+    /// bottom pin ([`Self::hold_for_fold`]): following the tail would carry
+    /// the chip away from the pointer that clicked it. The send room takes the card's change in the same layout (see
     /// [`send_motion::SendMotion::room_with_fold`]); and the row's top is held
     /// where the reader clicked it until the fold settles — see
     /// [`Self::hold_fold`].
     pub fn toggle_tool(&mut self, call_id: SharedString, row: usize, cx: &mut Context<Self>) {
+        // Where the card is now: mid-fold if this click turns one round, at
+        // rest otherwise.
+        let from = match &self.fold {
+            Some((call, at, _, from)) if *call == call_id => chip::fold_openness(
+                *from,
+                self.expanded.contains(&call_id),
+                at.map_or(0.0, Self::fold_elapsed_ms),
+            ),
+            _ => f32::from(u8::from(self.expanded.contains(&call_id))),
+        };
         if !self.expanded.remove(&call_id) {
             self.expanded.insert(call_id.clone());
         }
-        // Read before the remeasure: an unmeasured row reports no bounds.
+        self.hold_for_fold(row);
+        // The fold is timed from the click, and only from a click: a chip that
+        // scrolls back into view has no fold in flight and renders at rest.
+        self.fold = Some((call_id, None, row, from));
+        self.fold_landed = false;
+        self.list.remeasure_items(row..row + 1);
+        cx.notify();
+    }
+
+    /// Show a long prompt whole, or clip it again. Its top stays where the
+    /// reader clicked, as for a chip's fold.
+    pub fn toggle_prompt(&mut self, prompt: SharedString, row: usize, cx: &mut Context<Self>) {
+        if !self.open_prompts.remove(&prompt) {
+            self.open_prompts.insert(prompt);
+        }
+        self.hold_for_fold(row);
+        self.list.remeasure_items(row..row + 1);
+        cx.notify();
+    }
+
+    /// Start holding `row` where it is, for a fold the reader just clicked,
+    /// and stop following the tail.
+    fn hold_for_fold(&mut self, row: usize) {
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_tick = None;
+        self.send_motion.glide = false;
+        // Read before any remeasure: an unmeasured row reports no bounds.
         self.fold_hold = self
             .list
             .bounds_for_item(row)
             .map(|bounds| (row, f32::from(bounds.top())));
-        // The fold is timed from the click, and only from a click: a chip that
-        // scrolls back into view has no fold in flight and renders at rest.
-        self.fold = Some((call_id, std::time::Instant::now(), row));
-        self.list.remeasure_items(row..row + 1);
-        cx.notify();
     }
 
     /// Keep the folding row's top where it was when the reader clicked.
@@ -1438,21 +1568,35 @@ impl AgentChat {
         }
     }
 
-    /// The fold in flight this frame, and whether it still needs frames.
+    /// The fold in flight this frame: which call, and how open its card is.
     ///
     /// Advanced here rather than inside the chip because the *row* is what has
     /// to be remeasured on every step: the card's height is changing, and the
     /// list caches heights.
     fn tick_fold(&mut self, reduced_motion: bool) -> Option<(SharedString, f32)> {
-        let (call, at, row) = self.fold.clone()?;
-        if reduced_motion || at.elapsed() >= luma_ui::motion::span(&luma_ui::motion::SURFACE) {
-            self.fold = None;
-            self.list.remeasure_items(row..row + 1);
-            return None;
+        let (call, at, row, from) = self.fold.clone()?;
+        let elapsed = at.map_or(0.0, Self::fold_elapsed_ms);
+        if at.is_none() {
+            if let Some(fold) = &mut self.fold {
+                fold.1 = Some(std::time::Instant::now());
+            }
         }
-        let progress = luma_ui::motion::exit_progress(&luma_ui::motion::SURFACE, at);
         self.list.remeasure_items(row..row + 1);
-        Some((call, progress))
+        let open = self.expanded.contains(&call);
+        if reduced_motion || elapsed >= theme::TOOL_FOLD_MS {
+            if std::mem::replace(&mut self.fold_landed, true) {
+                self.fold = None;
+                return None;
+            }
+            return Some((call, f32::from(u8::from(open))));
+        }
+        Some((call, chip::fold_openness(from, open, elapsed)))
+    }
+
+    /// How long ago a fold was clicked, on the motion clock: a stretched
+    /// timeline (see [`luma_ui::motion::speed_scale`]) stretches the fold.
+    fn fold_elapsed_ms(at: std::time::Instant) -> f32 {
+        at.elapsed().as_secs_f32() * 1000.0 / luma_ui::motion::speed_scale().max(0.001)
     }
 
     /// Stop the shown thread's turn. Turns of other threads keep running.
@@ -1545,7 +1689,7 @@ impl AgentChat {
                 .join("\n\n");
             self.composer.restore(&draft, cx);
             self.send_motion.pending.clear();
-            self.send_motion.flight = None;
+            self.send_motion.glide = false;
             self.send_motion.anchor = None;
             self.send_motion.anchor_offset = None;
             self.send_motion.room = 0.0;
@@ -1589,8 +1733,8 @@ impl AgentChat {
             context: Some(self.editor_context(cx)),
         };
         if let Some(thread) = self.thread_id().filter(|_| self.is_streaming()) {
-            self.running.read(cx).steer(thread, message);
-            self.start_send_motion(prompt, cx);
+            self.running.read(cx).steer(thread, message.clone());
+            self.start_send_motion(&message, cx);
             self.settle_trailer();
             self.composer.clear(cx);
             cx.notify();
@@ -1603,6 +1747,7 @@ impl AgentChat {
         };
         let agent = self.agent.clone();
         let transcript = self.transcript.clone();
+        let sent = message.clone();
         let started = self.running.update(cx, |running, cx| {
             running.start(&thread, transcript, || agent.turn(&thread, message), cx)
         });
@@ -1617,7 +1762,7 @@ impl AgentChat {
         };
         self.composer.clear(cx);
         self.error = None;
-        self.start_send_motion(prompt, cx);
+        self.start_send_motion(&sent, cx);
         self.turn = Some(since);
         self.settle_trailer();
         cx.notify();
@@ -1832,6 +1977,16 @@ impl Render for AgentChat {
     }
 }
 
+/// The `escape_stops_turn` setting. Unset reads as on, the setting's default.
+struct EscapeStopsTurn(bool);
+
+impl gpui::Global for EscapeStopsTurn {}
+
+/// Adopt the setting: whether Escape in the composer stops a running turn.
+pub fn set_escape_stops_turn(on: bool, cx: &mut App) {
+    cx.set_global(EscapeStopsTurn(on));
+}
+
 /// The `compact_turns` setting, shared by every chat panel in the app. Unset
 /// reads as on, the setting's default.
 struct CompactTurns(bool);
@@ -1877,6 +2032,9 @@ impl AgentChat {
             )
         });
         let error = self.error.clone();
+        let sign_in = self
+            .sign_in_offer()
+            .map(|service| (service, self.signing_in));
         // Whether the composer's row is complete: the thread's read has landed,
         // and with it the model picker, whose label is the one it keeps — or
         // the read failed and nothing more is coming.
@@ -1905,7 +2063,6 @@ impl AgentChat {
         // the spring parks, `spring_tick` clears, and an idle panel schedules
         // nothing at all.
         if (self.pinned && (streaming || self.spring_tick.is_some()))
-            || self.send_motion.flight.is_some()
             || self.send_motion.anchor.is_some()
             || self.fold_hold.is_some()
         {
@@ -1914,9 +2071,8 @@ impl AgentChat {
             window.on_next_frame(move |_, cx| {
                 chat.update(cx, |this, cx| {
                     let old_room = this.send_motion.room;
-                    let had_flight = this.send_motion.flight.is_some();
                     let old_scroll = this.list.scroll_px_offset_for_scrollbar();
-                    this.step_send_motion(reduced);
+                    this.step_send_motion();
                     if reduced && this.pinned {
                         this.list.scroll_to_end();
                         this.spring_tick = None;
@@ -1924,8 +2080,12 @@ impl AgentChat {
                         this.step_spring();
                     }
                     this.hold_fold();
+                    // The glide is over once the room has stopped changing
+                    // and the view has reached the end it was rising to.
+                    if old_room == this.send_motion.room && this.distance < 1.0 {
+                        this.send_motion.glide = false;
+                    }
                     if old_room != this.send_motion.room
-                        || had_flight
                         || this.spring_tick.is_some()
                         || old_scroll != this.list.scroll_px_offset_for_scrollbar()
                     {
@@ -1936,7 +2096,12 @@ impl AgentChat {
         }
         // Far enough up that the way back is worth offering. Read before the
         // list is built so it reflects the same frame the rows do.
-        let adrift = !self.pinned && self.distance > theme::SCROLL_BUTTON_THRESHOLD_PX;
+        // Shown once the reader is that far up, and kept until they are back
+        // at the end: it does not vanish halfway through the scroll down.
+        self.adrift = !self.pinned
+            && (self.distance > theme::SCROLL_BUTTON_THRESHOLD_PX
+                || (self.adrift && self.distance > theme::STICK_THRESHOLD_PX));
+        let adrift = self.adrift;
         let fold = self.tick_fold(luma_ui::motion::reduced_motion(cx));
         if fold.is_some() {
             window.request_animation_frame();
@@ -1975,9 +2140,12 @@ impl AgentChat {
         // The composer grew or shrank: the list's bottom padding moves with it,
         // and a pinned view has to move too or the tail slides under the
         // composer.
+        // Not under a message just sent: the composer collapses as it empties,
+        // and snapping on each frame of that would replace the glide the
+        // message rises on.
         if footer != self.pin_footer {
             self.pin_footer = footer;
-            if self.pinned {
+            if self.pinned && !self.send_motion.glide {
                 self.list.scroll_to_end();
                 self.distance = 0.0;
             }
@@ -2004,24 +2172,19 @@ impl AgentChat {
             held.update(cx, |state, cx| {
                 let Some(key) = state.rows.get(ix).copied() else {
                     if let Some(prompt) = state.send_motion.pending.get(ix - state.rows.len()) {
-                        let flying = state
-                            .send_motion
-                            .flight
-                            .as_ref()
-                            .is_some_and(|flight| flight.id == prompt.id);
-                        // Shown from the send's first frame, under the slot
-                        // the message is flying to: the reader sees at once
-                        // that the panel heard them.
+                        // Shown from the send's first frame: the reader sees
+                        // at once that the panel heard them.
                         let trailer = (last_item == Some(ix))
                             .then_some(trailer)
                             .flatten()
                             .map(|trailer| working::trailer(&trailer, &state.theme, view, cx));
-                        // The same centred reading column a row has (see
-                        // `transcript::row`), so the message does not move
-                        // sideways when the turn's own row replaces it.
+                        // The row the turn's own will be (see
+                        // `transcript::row`): the same gap, column, bubble
+                        // and note, so the message does not move when that
+                        // row replaces it.
                         return div()
                             .w_full()
-                            .pt(px(theme::GAP_BLOCK))
+                            .pt(px(transcript::prompt_gap(ix == 0)))
                             .flex()
                             .flex_col()
                             .items_center()
@@ -2032,12 +2195,12 @@ impl AgentChat {
                                     .min_w_0()
                                     .flex()
                                     .flex_col()
-                                    .child(div().opacity(if flying { 0.0 } else { 1.0 }).child(
-                                        transcript::user_bubble(
-                                            &prompt.text,
-                                            &prompt.id,
-                                            &state.theme,
-                                        ),
+                                    .child(transcript::prompt_body(
+                                        &prompt.text,
+                                        &prompt.id,
+                                        prompt.attached.clone(),
+                                        transcript::PromptFold::pending(&prompt.text),
+                                        &state.theme,
                                     ))
                                     .children(trailer),
                             )
@@ -2084,14 +2247,10 @@ impl AgentChat {
                             &key,
                         ),
                         last_of_turn,
-                        flying: state
-                            .send_motion
-                            .flight
-                            .as_ref()
-                            .is_some_and(|flight| flight.id.as_ref() == message.id),
                         trailer: (last_item == Some(ix)).then_some(trailer).flatten(),
                         expanded: &state.expanded,
                         open_work: &state.open_work,
+                        open_prompts: &state.open_prompts,
                         cells: &state.cells,
                         viewed: &state.viewed,
                         agent: &state.agent,
@@ -2115,22 +2274,6 @@ impl AgentChat {
 
         let plate_bounds = self.plate_bounds.clone();
         let composer_bounds = self.composer_bounds.clone();
-        let flight = self.send_motion.flight.as_ref().map(|flight| {
-            div()
-                .absolute()
-                .top(px(flight.y - f32::from(self.plate_bounds.get().top())))
-                .left(px(theme::CONTENT_GUTTER))
-                .right(px(theme::CONTENT_GUTTER))
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(theme::MAX_CONTENT_WIDTH))
-                        .child(transcript::user_bubble(&flight.text, &flight.id, &theme)),
-                )
-                .agent_node(NodeRole::Card, "Sending message")
-        });
         self.plate(&theme)
             .font(luma_ui::fonts::font(theme.font_sans.clone()))
             .child(
@@ -2147,16 +2290,35 @@ impl AgentChat {
                     .flex_1()
                     .min_h_0()
                     .on_scroll_wheel(cx.listener(|this, event, _, _| this.on_wheel(event)))
+                    // A drag is a selection being made, and following the
+                    // tail would pull the text out from under it. A click is
+                    // not: opening a chip or a link leaves the view following.
                     .on_mouse_down(
                         gpui::MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
+                            this.press = Some(event.position);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                        if event.pressed_button != Some(gpui::MouseButton::Left) {
+                            this.press = None;
+                            return;
+                        }
+                        let Some(press) = this.press else {
+                            return;
+                        };
+                        let moved = event.position - press;
+                        if f32::from(moved.x).abs().max(f32::from(moved.y).abs())
+                            > theme::DRAG_SLOP_PX
+                        {
+                            this.press = None;
                             this.pinned = false;
                             this.spring.reset();
                             this.spring_tick = None;
-                            this.send_motion.flight = None;
+                            this.send_motion.glide = false;
                             cx.notify();
-                        }),
-                    )
+                        }
+                    }))
                     // The reading column's minimum gutters. The 736 cap lives
                     // on each row (`transcript::row`) because a `list` hands
                     // its items the full width.
@@ -2269,7 +2431,7 @@ impl AgentChat {
                                     cx,
                                 ))
                                 .children(resume_strip(resumable, &this, &theme))
-                                .children(error_strip(error.as_deref(), &theme))
+                                .children(error_strip(error.as_deref(), sign_in, &this, &theme))
                                 // The subagent pill clears the full composer.
                                 .children(subagents::pill(&self.subagents, &this, &theme)),
                         ),
@@ -2278,7 +2440,6 @@ impl AgentChat {
             // A reader is mounted inside a dialog that already carries a header
             // band; a second one would be two titles over one conversation.
             .when(!self.read_only, |el| el.child(self.header(&this)))
-            .children(flight)
             .into_any_element()
     }
 
@@ -2595,9 +2756,6 @@ fn suggestion(
         .agent_node(NodeRole::Button, prompt)
 }
 
-/// The error line under the composer, or nothing. Only a failure earns the
-/// space: the send hint went with the language label, and the context gauge
-/// lives in the composer's cluster.
 /// The offer to continue a turn that stopped part way. Never automatic: a
 /// resume spends money, so it waits for the reader.
 fn resume_strip(show: bool, chat: &Entity<AgentChat>, theme: &Theme) -> Option<AnyElement> {
@@ -2630,8 +2788,35 @@ fn resume_strip(show: bool, chat: &Entity<AgentChat>, theme: &Theme) -> Option<A
     )
 }
 
-fn error_strip(error: Option<&str>, theme: &Theme) -> Option<AnyElement> {
+/// The error line under the composer, or nothing. Only a failure earns the
+/// space: the send hint went with the language label, and the context gauge
+/// lives in the composer's cluster. `sign_in` is the service whose own
+/// sign-in would fix the failure, and whether that is running: the line then
+/// ends in the button that runs it.
+fn error_strip(
+    error: Option<&str>,
+    sign_in: Option<(Service, bool)>,
+    chat: &Entity<AgentChat>,
+    theme: &Theme,
+) -> Option<AnyElement> {
     let error = error?;
+    let button = sign_in.map(|(service, running)| {
+        let chat = chat.clone();
+        let label = if running {
+            "Finish in your browser…".to_string()
+        } else {
+            format!("Sign in to {}", service.label())
+        };
+        let enabled = if running {
+            luma_ui::Enabled::No
+        } else {
+            luma_ui::Enabled::Yes
+        };
+        luma_ui::button(&label, enabled)
+            .id("sign-in")
+            .on_click(move |_, _, cx| chat.update(cx, |this, cx| this.sign_in(cx)))
+            .agent_node(NodeRole::Button, label)
+    });
     Some(
         div()
             .h(px(theme::STATUS_STRIP_HEIGHT))
@@ -2639,13 +2824,21 @@ fn error_strip(error: Option<&str>, theme: &Theme) -> Option<AnyElement> {
             .flex()
             .flex_row()
             .items_center()
+            .justify_between()
+            .gap(px(theme::SPACE_MD))
             .w_full()
             .px(px(theme::SPACE_LG))
             .mt(px(theme::SPACE_XS))
             .text_size(px(11.0))
-            .text_color(theme.danger)
-            .child(SharedString::from(error.to_string()))
-            .agent_node(NodeRole::Text, error.to_string())
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(error.to_string()))
+                    .agent_node(NodeRole::Text, error.to_string()),
+            )
+            .children(button)
             .into_any_element(),
     )
 }

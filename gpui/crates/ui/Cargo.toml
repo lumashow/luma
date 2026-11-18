@@ -11,6 +11,14 @@ gpui-component-assets = { workspace = true }
 unicode-segmentation = "1"
 luma-patterns = { path = "../../../backend/crates/patterns" }
 
+# The trackpad's tap under a control's detent (`haptics`).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSHapticFeedback",
+] }
+
 [features]
 # Publishes the automation node tree (`luma_ui::node`) that `gpui-agent` reads.
 # Off by default: with the feature disabled `agent_node()` is the identity and

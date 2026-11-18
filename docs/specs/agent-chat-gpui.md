@@ -50,8 +50,24 @@ wire id per provider. `ModelId::route` picks a provider that serves the model.
 | `OpenRouter` | `model/openrouter.rs` |
 
 A thread also names an engine (`agent/engine/`): `Api` runs the loop against
-the providers above; `Codex` and `Claude` run the installed CLIs with their own
-accounts and give them Luma's tools.
+the providers above; `Codex`, `Claude` and `Antigravity` run the installed CLIs
+with their own accounts and give them Luma's tools. When a CLI's login is
+missing or expired the turn fails saying so, and the chat offers to run that
+CLI's own sign-in (`agent/engine/auth.rs`).
+
+Antigravity runs as `agy acp` (the Agent Client Protocol on stdio,
+`agent/engine/antigravity.rs`). It takes tools only as MCP servers, so each
+session serves Luma's tools on a loopback MCP endpoint with a bearer token of
+its own (`agent/engine/mcp_http.rs`). The CLI asks permission before every
+tool call; Luma's tools are allowed and the CLI's own are refused.
+
+Settings → AI lists each CLI with its version, account and plan
+(`agent/engine/providers.rs`), and the model picker shows how much of the
+plan is used (`agent/engine/plan_usage.rs`). Codex's app server answers the
+usage question. Claude Code has no command for it, so its usage endpoint is
+read with the access token the CLI saved; the token is only read, never
+refreshed. Antigravity answers through its `/usage` command, with a session
+and a week for each group of models that share an allowance.
 
 ### 2.2 Keys
 

@@ -41,7 +41,7 @@ const rows = (s) => {
 };
 // Every service's list has landed: each has a tab, or says why it has none.
 // Lists land one by one, each moving the rows of the ones after it.
-const SERVICES = ["Claude Code", "Codex", "OpenRouter", "Vercel AI Gateway"];
+const SERVICES = ["Claude Code", "Codex", "Antigravity", "OpenRouter", "Vercel AI Gateway"];
 const allListed = (s) => SERVICES.every((service) =>
   s.find({ role: "button", label: service }) || s.find((n) => n.role === "text" && n.label.startsWith(`${service}: `)));
 // A row is labelled "name · service"; the chip "service · name".
@@ -101,7 +101,8 @@ test("each service's first row names a model, and the chip names a listed one", 
   openChat();
   open();
   const chosen = chosenName(app.snapshot());
-  app.click(panel(app.snapshot()));
+  // The card is still unfolding from its chip; press its title once it rests.
+  app.click(still("the panel's title", panel));
   // The models open on the chosen one.
   until(`a row for ${chosen}`, (s) => rows(s).some((r) => name(r) === chosen));
   until("every service's list", allListed);
@@ -234,7 +235,9 @@ test("scrolling and searching the card redraw only the card", () => {
   // Opening the panel may save the model's level (a model runs at one of its
   // own); let that land before counting.
   until("the level saved", (s) => level(s) && chip(s)?.enabled);
-  app.click(panel(app.snapshot()));
+  // The card is still unfolding from its chip; its title is the last of it
+  // to come into view.
+  app.click(still("the panel's title", panel));
   const list = settledRows("the models", (r) => r.length > 3);
   const count = (label) => {
     const node = app.snapshot().find((n) => n.role === "text" && n.label.startsWith(`${label} renders = `));
