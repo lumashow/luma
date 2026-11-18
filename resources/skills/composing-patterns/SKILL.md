@@ -59,9 +59,15 @@ for s in snare.time_s:
 edit.check()
 ```
 
-The look is one function, so every hit shares one graph. When every hit in
-the range sits on the grid, one clip with `hit(every=4)` does the same job;
-when any hit is off the grid or a bar is skipped, it is one clip per hit.
+The look is one function, so every hit shares one graph. One clip per hit is
+for hits with a rest between them, as here. Events that run back to back at
+a steady rate (a pulse, a roll, a chase) are one clip, `hit(every=1/4)` over
+the bars where they play, each event filling its period. Repeats go inside
+the clip; rests go outside it, as the space between clips. Never give a
+repeating clock a `duration` shorter than its `every`. A skipped bar or a
+change of rate ends the clip and the next run is another clip of the same
+graph. To start a pattern later, move the clip: a number in `delay` is never
+the way.
 
 `clip.graph.source()` prints Python that builds the same graph. Use it to
 read a clip that is already in the score, change a line, and pass the new

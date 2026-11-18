@@ -85,13 +85,12 @@ Depth: maximum. Intricate detail that mirrors the audio is the product here.
 - Listen for: the growl's rate and every rate switch, scoops (pitch or
   filter? check), womps per bar, cuts where the bass drops out for a 16th, and
   what the second half of a 2-bar phrase changes.
-- Detail: 16th resolution on every drop phrase. Run the full loop, the
-  skeptic pass, and parallel listeners (bass, drums and cuts, vocals,
-  transitions) on each distinct drop phrase.
+- Detail: 16th resolution on every drop phrase. Run the full loop and the
+  skeptic pass on each distinct drop phrase, once for each aspect: bass,
+  drums and cuts, vocals, transitions.
 - LDs love: a light that switches rate exactly when the LFO does, and a
   blackout on the one 16th the bass cuts.
 
-To design, map sections and fix palette and group roles yourself, then give
-each child one drop phrase with the bass evidence rows and your arc decisions
-in its brief. Stitch, walk the seams, and confirm the drops outrank everything
-else on the heatmap.
+To design, map sections and fix palette and group roles first, then build one
+drop phrase at a time from its bass evidence rows. Walk the seams, and confirm
+the drops outrank everything else on the heatmap.

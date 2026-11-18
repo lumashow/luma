@@ -95,30 +95,6 @@ it false? Run that. For "the scoop goes down", show the pitch; for "the drums
 cut", show the kick onsets and the low band at that 16th. Answer each
 objection with a row, or revise the claim.
 
-When the budget calls for it, spawn a skeptic subagent instead. Brief: the
-bars, `luma.music.feel`, your claims as rows, and "Try to disprove each claim
-with `luma.music` and `luma.audio`. Return each claim as upheld, refuted or
-untested, with the output that decides it. Do not edit the score. Do not
-spawn subagents." Every refuted or untested claim gets a new test or leaves
-the description.
-
-## Parallel listeners
-
-When the genre skill calls for detail, fan out up to four subagents over the
-same bars, one per aspect:
-
-- bass: growl, womp, scoop; `modulation`, low/mid envelopes, pitch;
-- drums and cuts: onsets, `deviations`, holes in the mix;
-- vocals: the `vocals` envelope, chops, phrase ends;
-- transitions: the bars around each boundary, risers, fills, fake drops.
-
-Brief each with the bars, the feel, its aspect, the row format and "Return
-evidence rows only, no prose. Do not edit the score. Do not spawn
-subagents." Merge the rows by position. Where two listeners explain one
-position differently (drums: missing kick at `13.1.4`; bass: bass cut at
-`13.1.4`), that position is probably the most interesting thing in the
-phrase: test it yourself, or ask the user.
-
 ## Motion rules
 
 - One motion per event: three womps are three chase bounces, not one long

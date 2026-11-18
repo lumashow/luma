@@ -64,11 +64,10 @@ Depth: shallow, deliberately. Listen for sections, not notes.
 - Listen for: dynamics per phrase, instrumentation changes, solos, the quiet
   bridge, and the one transcendent moment.
 - Detail: one pass of the loop per section, at bar resolution. The grid
-  drifts here, so n2n positions are low-confidence. No skeptic subagent, no
-  parallel listeners.
+  drifts here, so n2n positions are low-confidence. No skeptic pass.
 - LDs love: a state change exactly on the section boundary, and the held-back
   gesture on the moment that earns it.
 
 A dozen well-placed section states and one held-back gesture beat any amount
-of intricacy. Over-detailing is the cardinal failure here; single pass, no
-subagents, and when in doubt: less.
+of intricacy. Over-detailing is the cardinal failure here; single pass, and
+when in doubt: less.

@@ -107,7 +107,6 @@ room and festival house still hide small motifs.
 - Detail: techno, deep and progressive: one pass of the loop per section, at
   bar resolution; find the pattern, not the notes. Big room, festival, tech
   and bass house: the full loop on each drop and on every recurring motif.
-  Parallel listeners only for bass-house drops.
 - LDs love: a motif that gets the same small light answer every time it
   returns, and the one new element in a long techno section getting a change.
 

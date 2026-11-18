@@ -71,9 +71,8 @@ Depth: moderate. Per phrase, not per onset.
   pump's depth, vocal chop rhythm, and the bar where the drop opens up.
 - Detail: one pass of the loop per phrase; a swell map (chord changes and
   envelope peaks per phrase) is usually enough. Run the skeptic pass on the
-  drop. Parallel listeners only when a drop turns aggressive.
+  drop.
 - LDs love: a color change that lands on the chord change, and a bloom timed
   to the swell's real peak, not the bar line.
 
-Score it in one pass so it reads as one hand. Fan out only when the track is
-too big for one careful pass, along its own seams.
+Score it in one pass so it reads as one hand.

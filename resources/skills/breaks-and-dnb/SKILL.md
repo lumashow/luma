@@ -63,9 +63,9 @@ Depth: moderate for liquid and UKG, deep for jump-up, neuro and jungle.
 - Detail: one careful loop analysis of the break at 16th resolution, reused
   across the track; `deviations` finds every bar that edits it. Ghost notes
   and hats are low-confidence in n2n. For neuro and jump-up drops, run the
-  skeptic pass and parallel listeners as in `heavy-bass`.
+  skeptic pass per aspect as in `heavy-bass`.
 - LDs love: the same light answer on the break's signature hits every bar,
   and a hard change on the break switch.
 
-One pass for the arc. Delegate only where the track diverges in character,
-split along those seams, with the bass evidence rows in each child's brief.
+One pass for the arc. Go deeper only where the track diverges in character,
+along those seams, from the bass evidence rows.

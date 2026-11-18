@@ -185,18 +185,15 @@ impl ToolRegistry {
     }
 }
 
-/// The tool set for an agent kind. Both a parent turn and a subagent turn call
-/// this; they differ only in the [`ToolContext`] they pass to the result.
+/// The tool set every agent turn gets. `subagent::SubagentTool` is not in it:
+/// subagents are off (a child could not read its parent's brief and its empty
+/// result was merged as work), so no turn can delegate.
 #[must_use]
-pub fn registry_for_context(authored: bool, storage: &crate::storage::StorageRoot) -> ToolRegistry {
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
+pub fn registry_for_context(storage: &crate::storage::StorageRoot) -> ToolRegistry {
+    ToolRegistry::new(vec![
         Arc::new(python::PythonTool::new(storage.clone())),
         Arc::new(skill::SkillTool),
-    ];
-    if authored {
-        tools.push(Arc::new(subagent::SubagentTool));
-    }
-    ToolRegistry::new(tools)
+    ])
 }
 
 /// Head+tail clamp for model-facing tool text.

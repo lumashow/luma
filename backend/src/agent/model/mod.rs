@@ -862,11 +862,9 @@ mod tests {
 
         // The shipped registry's own spec, not a hand-written stand-in: the
         // schema a real turn sends is the thing under test.
-        let specs = tools::registry_for_context(
-            true,
-            &crate::storage::StorageRoot::from_path("/unused".into()),
-        )
-        .specs();
+        let specs =
+            tools::registry_for_context(&crate::storage::StorageRoot::from_path("/unused".into()))
+                .specs();
         assert_eq!(specs.len(), 1, "the track agent declares one tool");
         println!(
             "input_schema: {}",
@@ -959,11 +957,9 @@ mod tests {
         use crate::agent::tools;
         use futures_util::StreamExt;
 
-        let specs = tools::registry_for_context(
-            true,
-            &crate::storage::StorageRoot::from_path("/unused".into()),
-        )
-        .specs();
+        let specs =
+            tools::registry_for_context(&crate::storage::StorageRoot::from_path("/unused".into()))
+                .specs();
         let system = vec![crate::agent::system_prompt().to_string()];
         let first = ModelMessage {
             role: ModelRole::User,

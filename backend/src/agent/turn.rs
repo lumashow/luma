@@ -280,9 +280,11 @@ impl Turn {
         // the editor shows travels with each user message instead.
         let system = super::system_prompt().to_string();
 
-        let registry = self.service.tools.clone().unwrap_or_else(|| {
-            tools::registry_for_context(authored, self.service.services().storage())
-        });
+        let registry = self
+            .service
+            .tools
+            .clone()
+            .unwrap_or_else(|| tools::registry_for_context(self.service.services().storage()));
         // Only a subagent thread works on a draft; a root thread edits live.
         let draft_id = match (authored, detail.thread.score_id.as_deref()) {
             (true, Some(score_id)) if detail.thread.parent_thread_id.is_some() => {
