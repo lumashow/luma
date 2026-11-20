@@ -397,8 +397,6 @@ fn stream_command(cwd: &std::path::Path) -> Result<tokio::process::Command, Agen
         "stdio",
         "--setting-sources",
         "",
-        "--max-turns",
-        "64",
     ]);
     Ok(cmd)
 }
