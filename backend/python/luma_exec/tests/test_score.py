@@ -131,6 +131,34 @@ class ScoreTests(unittest.TestCase):
         with self.assertRaisesRegex(TrackError, "label 'kept' is on two clips"):
             edit.replace_source(json.dumps({"clips": {kept.id: stored, "other": stored}}))
 
+    def beams(self, yaw_deg, lit):
+        """Two beams over eight samples: light [2, 8], aim [2, 8, 3] and weight [2, 8]."""
+        import numpy as np
+        yaw = np.radians(np.asarray(yaw_deg, dtype=float))
+        aim = np.stack([np.sin(yaw), np.zeros_like(yaw), -np.cos(yaw)], axis=-1)
+        return (np.repeat(np.asarray(lit, dtype=float)[None, :], 2, axis=0),
+                np.repeat(aim[None, :, :], 2, axis=0), np.ones((2, 8)))
+
+    def test_a_lit_beam_that_changes_aim_in_one_step_is_a_snap(self):
+        from luma_exec.score import _aim_snaps
+        jump = [0, 0, 0, 0, 60, 60, 60, 60]
+        lit = _aim_snaps(*self.beams(jump, [1] * 8))
+        self.assertEqual([(index, lights) for index, lights, _ in lit], [(4, 2)])
+        self.assertAlmostEqual(lit[0][2], 60.0, places=3)
+        # The same move with the light off on either side of it is a move in the dark.
+        self.assertEqual(_aim_snaps(*self.beams(jump, [1, 1, 1, 0, 0, 1, 1, 1])), [])
+        # A sweep covers the same angle and never snaps.
+        self.assertEqual(_aim_snaps(*self.beams([0, 8, 16, 24, 32, 40, 48, 56], [1] * 8)), [])
+
+    def test_a_mover_lit_before_anything_aims_it_is_counted(self):
+        from luma_exec.score import _unaimed
+        light, _, weight = self.beams([0] * 8, [1] * 8)
+        weight[:, :3] = 0.0
+        self.assertEqual(list(_unaimed(light, weight)), [2, 2, 2, 0, 0, 0, 0, 0])
+        # A light nothing ever aims is a par, and a par has no rest position to worry about.
+        weight[1, :] = 0.0
+        self.assertEqual(list(_unaimed(light, weight)), [1, 1, 1, 0, 0, 0, 0, 0])
+
     def rendered(self, level):
         """A 48-bar track whose render is `level(seconds)` per light: (lights, rgb level)."""
         import numpy as np

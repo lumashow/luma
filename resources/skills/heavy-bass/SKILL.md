@@ -28,6 +28,14 @@ light what you measured.
 - The fastest strobe belongs to the phrase whose measured rate is actually
   fastest. Save it for that phrase.
 
+This music is physical. On the drop the sub is hitting the crowd in the
+chest, and the light's job is to do the same thing to their eyes. Do not
+accompany the bass: fuck the room with it. Full, hard, on the hit, then
+gone. Strobes on the deepest notes are not a risk here, they are the point.
+If you catch yourself hedging at 60%, you did not believe the sound, so you
+must dig deeper into the frequencies until you know exactly what it is doing,
+and then commit to it completely.
+
 ## Feel
 
 - Halftime drums: at 140 the snare lands every fourth felt beat, so the

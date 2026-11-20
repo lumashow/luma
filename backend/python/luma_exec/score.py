@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from .clip import ClipError, Graph, _preset_name, preset
 from .color import from_srgb
 from .host_errors import LumaHostCallError
-from .track import (TrackOutput, TrackError, TrackReadOnlyError,
+from .track import (CheckResult, TrackOutput, TrackError, TrackReadOnlyError,
                     TrackClosedError, TrackHostUnavailableError,
                     _ImmutableSnapshot, _field, _items,
                     _freeze, _range_pair, _selection, _blend, _z,
@@ -582,7 +582,16 @@ class Edit:
         Reports every clip the checker refuses. The verb is check(), not validate().
         """
         self._open()
-        return _check_result(self._track._call("track.score_check", {"candidate": self.candidate}))
+        result = _check_result(self._track._call("track.score_check", {"candidate": self.candidate}))
+        if not result.ok or not _has_aim(self._candidate):
+            return result
+        try:
+            start, end = _show_range(self._track, self._candidate)
+            aim = _aim_warnings(self._track, *_rendered(self._track, self._candidate, start, end))
+        except TrackError:
+            # A host that renders no aim channel has nothing to measure.
+            return result
+        return CheckResult(result.ok, result.errors, result.warnings + aim)
 
     def apply(self):
         """Validate and commit the candidate, then close this edit.
@@ -731,6 +740,109 @@ _ALL_LIT, _BIG_RIG = 0.30, 100
 _OFF_MUSIC = 0.2
 
 
+def _has_aim(document):
+    return any(node.get("kind") == "aim"
+               for clip in (document.get("clips") or {}).values()
+               for node in ((clip.get("graph") or {}).get("nodes") or {}).values())
+
+
+def _show_range(track, document):
+    """The beats a whole-score measurement covers: the track, or the clips when it has no length."""
+    clips = (document.get("clips") or {}).values()
+    start = track._beat_at(0.0)
+    end = max([start] + [clip["start"] + clip["duration"] for clip in clips])
+    if track.duration_s > 0:
+        end = track._beat_at(track.duration_s) - _TOUCH
+    if end <= start:
+        raise TrackError("there is nothing to review: the track has no length and the score no clips")
+    return start, end
+
+
+def _rendered(track, document, start, end):
+    """The score's render over [start, end) beats: light [light, time], aim
+    [light, time, 3] or None, aim weight [light, time] or None, and times in
+    seconds. Sixteen samples to a beat."""
+    import numpy as np
+    light, aim, weight, times = [], [], [], []
+    while start < end - _TOUCH:
+        stop = min(end, start + _REVIEW_CHUNK_BEATS)
+        output = Window(track, document, (start, stop)).output
+        light.append(np.asarray(output.values, dtype=float).max(axis=2))
+        times.extend(float(time) for time in output.times_s)
+        if aim is not None:
+            try:
+                turned = output.aim
+                aim.append(np.asarray(turned.values, dtype=float))
+                weight.append(np.asarray(turned.weight, dtype=float))
+            except TrackError:
+                aim = weight = None
+        start = stop
+    return (np.concatenate(light, axis=1),
+            None if aim is None else np.concatenate(aim, axis=1),
+            None if weight is None else np.concatenate(weight, axis=1),
+            times)
+
+
+def _aim_snaps(light, aim, weight):
+    """Where lit beams change aim in a single step.
+
+    One (sample index, lights, degrees) per moment: the sample the beams
+    arrive at, how many of them turned, and the furthest any turned. A beam
+    counts when it is lit and aimed on both sides of the step, so a move made
+    in the dark is not one, and neither is a beam picking up its first aim.
+    """
+    import numpy as np
+    if aim is None or aim.shape[1] < 2:
+        return []
+    cos = np.clip((aim[:, 1:] * aim[:, :-1]).sum(axis=2), -1.0, 1.0)
+    turn = np.degrees(np.arccos(cos))
+    seen = (light[:, 1:] > _LIT) & (light[:, :-1] > _LIT) & (weight[:, 1:] > _AIMED) & (weight[:, :-1] > _AIMED)
+    snapped = seen & (turn > _SNAP_DEG)
+    return [(int(index) + 1, int(snapped[:, index].sum()), float(turn[snapped[:, index], index].max()))
+            for index in np.flatnonzero(snapped.any(axis=0))]
+
+
+def _unaimed(light, weight):
+    """Per sample, how many lights that the show aims somewhere are lit with no aim on them."""
+    import numpy as np
+    if weight is None:
+        return np.zeros(light.shape[1], dtype=int)
+    movers = (weight > _AIMED).any(axis=1)
+    return ((light > _LIT) & (weight <= _AIMED) & movers[:, None]).sum(axis=0)
+
+
+def _aim_warnings(track, light, aim, weight, times):
+    """What a room would see go wrong with the beams, as warnings."""
+    import numpy as np
+    found = []
+    snaps = _aim_snaps(light, aim, weight)
+    if snaps:
+        at = lambda index: track.bars.format(track._beat_at(times[index]))
+        shown = ", ".join(f"{at(index)} ({lights} lights, {degrees:.0f}°)"
+                          for index, lights, degrees in snaps[:_SHOWN])
+        more = f", and {len(snaps) - _SHOWN} more" if len(snaps) > _SHOWN else ""
+        found.append(f"lit beams snap to a new aim at {shown}{more}; a beam that changes shape in one "
+                     "step whips across the room in view: fade the aim in, let the move take as long "
+                     "as its sound, or make it in the dark")
+    loose = _unaimed(light, weight)
+    if loose.any():
+        bars = np.array([max(1, track.bars.bar_at(track._beat_at(time))) for time in times])
+        firsts = sorted({int((bar - 1) // _REVIEW_BARS * _REVIEW_BARS + 1) for bar in bars[loose > 0]})
+        found.append(f"up to {int(loose.max())} movers are lit with no aim in bars "
+                     f"{_spans(firsts, int(bars.max()))}; they point wherever they rest, and one "
+                     "standing on the floor rests pointing straight up")
+    return tuple(found)
+
+
+# An aim that turns further than this between two samples, a sixteenth of a
+# beat apart, did not travel there: it snapped.
+_SNAP_DEG = 15.0
+# An aim weight above this is a light something aimed.
+_AIMED = 0.01
+# At most this many moments are named in one warning.
+_SHOWN = 6
+
+
 def _spans(firsts, last):
     """Eight-bar sections by first bar as "1-8, 25-40", up to the last bar."""
     spans = []
@@ -763,20 +875,7 @@ class Review:
     def __init__(self, track, document):
         import numpy as np
         clips = (document.get("clips") or {}).values()
-        start = track._beat_at(0.0)
-        end = max([start] + [clip["start"] + clip["duration"] for clip in clips])
-        if track.duration_s > 0:
-            end = track._beat_at(track.duration_s) - _TOUCH
-        if end <= start:
-            raise TrackError("there is nothing to review: the track has no length and the score no clips")
-        light, times = [], []
-        while start < end - _TOUCH:
-            stop = min(end, start + _REVIEW_CHUNK_BEATS)
-            output = Window(track, document, (start, stop)).output
-            light.append(np.asarray(output.values, dtype=float).max(axis=2))
-            times.extend(float(time) for time in output.times_s)
-            start = stop
-        light = np.concatenate(light, axis=1)
+        light, aim, weight, times = _rendered(track, document, *_show_range(track, document))
         grid = track.bars
         bars = np.array([max(1, grid.bar_at(track._beat_at(time))) for time in times])
         level, lit = light.mean(axis=0), light > _LIT
@@ -792,7 +891,7 @@ class Review:
              float(share[section == index].mean()))
             for index in np.unique(section))
         self.follows_music = self._follows(track, bars, level)
-        self.warnings = self._warnings()
+        self.warnings = self._warnings() + _aim_warnings(track, light, aim, weight, times)
 
     def _follows(self, track, bars, level):
         import numpy as np
