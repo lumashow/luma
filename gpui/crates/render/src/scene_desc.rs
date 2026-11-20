@@ -1364,6 +1364,7 @@ impl Scene {
             }),
             self.pieces.iter().map(piece_box),
         )
+        .in_room(self.render.walls())
     }
 
     /// What can stand between a camera and a light, in world space: every
