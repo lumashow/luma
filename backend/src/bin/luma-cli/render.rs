@@ -15,11 +15,12 @@ pub async fn run(mut args: super::Args) -> Result<(), String> {
     let mut state_path = None;
     let mut view = View::Front;
     let mut format = String::from("png");
+    let mut draw = String::from("editor");
     let mut width = 1600u32;
     let mut height = 1000u32;
     while let Some(arg) = args.next() {
         if arg == "--help" {
-            println!("luma-cli render --venue-id UUID --output PATH [--db PATH] [--state PATH] [--format png|catalogue] [--view front|audience|overhead|quarter_left|quarter_right|dj] [--width PX] [--height PX]");
+            println!("luma-cli render --venue-id UUID --output PATH [--db PATH] [--state PATH] [--format png|catalogue] [--view front|audience|overhead|quarter_left|quarter_right|dj] [--draw editor|show] [--width PX] [--height PX]");
             return Ok(());
         }
         let value = args
@@ -27,6 +28,7 @@ pub async fn run(mut args: super::Args) -> Result<(), String> {
             .ok_or_else(|| format!("{arg} requires a value"))?;
         match arg.as_str() {
             "--format" => format = value,
+            "--draw" => draw = value,
             "--db" => db = PathBuf::from(value),
             "--venue-id" => venue = Some(value),
             "--output" => output = Some(PathBuf::from(value)),
@@ -53,11 +55,19 @@ pub async fn run(mut args: super::Args) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", db.display()))?;
     let fixtures_root = luma_lib::resources::fixtures_root()?;
     let geometry = VenueGeometry::load(&pool, &fixtures_root, &venue).await?;
-    let (mut scene, definitions) = geometry.scene();
-    // The stage's own look, as an agent's stills take it.
-    if let Ok(settings) = luma_lib::settings::load_settings(&pool).await {
-        scene.render.look = luma_render::scene_desc::Look::stored(&settings.stage_look);
-    }
+    let settings = luma_lib::settings::load_settings(&pool).await;
+    let (scene, definitions) = match draw.as_str() {
+        "show" => geometry.show_scene(&settings.unwrap_or_default()),
+        "editor" => {
+            let (mut scene, definitions) = geometry.scene();
+            // The stage's own look, as an agent's stills take it.
+            if let Ok(settings) = settings {
+                scene.render.look = luma_render::scene_desc::Look::stored(&settings.stage_look);
+            }
+            (scene, definitions)
+        }
+        _ => return Err("--draw must be editor or show".into()),
+    };
     if format == "catalogue" {
         let catalogue = luma_render::scene_desc::Catalogue {
             warmup_frames: 30,
