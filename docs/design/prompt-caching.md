@@ -5,8 +5,8 @@ Status: built. Code: `backend/src/agent/model/mod.rs` (`CacheRetention`),
 
 The in-app agent marks the stable prefix of each request with `cache_control`.
 The scheme copies Pi (`badlogic/pi-mono`, `packages/ai`). It applies to turns
-that Luma sends to a model API. The Codex and Claude CLI engines manage their
-own caching.
+that Luma sends to a model API. The CLI engines (Codex, Claude, Antigravity)
+manage their own caching.
 
 ## The knob
 

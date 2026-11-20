@@ -1,10 +1,9 @@
-//! New-turn room and the message's flight from the composer. Layout owns the
-//! destination; the shared live spring follows it without losing velocity.
+//! New-turn room and the rise under a sent message. The message is a row of
+//! the transcript from the moment it is sent, and the transcript glides it to
+//! the head of the view: nothing is drawn over the list.
 use std::collections::VecDeque;
-use std::time::Instant;
 
 use gpui::SharedString;
-use luma_ui::motion;
 
 pub const PEEK: f32 = 48.0;
 /// How much faster than a streaming follow the transcript rises under a sent
@@ -12,56 +11,20 @@ pub const PEEK: f32 = 48.0;
 /// lands in about 680 ms — Comet's own-send glide (90% in ~230 ms). Adapted
 /// from Comet, MIT, (c) 2026 Wing.
 pub const SCROLL_RATE: f32 = 1.5;
-/// The message's flight from the composer: the quick rung, so the prompt is
-/// in place about as soon as the transcript has made room for it.
-const FLIGHT: motion::MotionSpec = motion::MotionSpec::new(motion::QUICK, motion::ROOT);
-
 pub struct Pending {
     pub id: SharedString,
     pub text: String,
-}
-
-pub struct Flight {
-    pub id: SharedString,
-    pub text: String,
-    pub y: f32,
-    velocity: f32,
-    tick: Instant,
-}
-
-impl Flight {
-    pub fn step(&mut self, target: f32, reduced: bool) -> bool {
-        let now = Instant::now();
-        let seconds = now.duration_since(self.tick).as_secs_f32().min(0.05);
-        self.tick = now;
-        let (y, velocity) = advance(self.y, self.velocity, target, seconds, reduced);
-        self.y = y;
-        self.velocity = velocity;
-        (y - target).abs() < 0.5 && velocity.abs() < 2.0
-    }
-}
-
-fn advance(y: f32, velocity: f32, target: f32, seconds: f32, reduced: bool) -> (f32, f32) {
-    if reduced {
-        return (target, 0.0);
-    }
-    let (offset, velocity) = motion::ROOT.advance(
-        y - target,
-        velocity,
-        seconds,
-        motion::span(&FLIGHT).as_secs_f32(),
-    );
-    // Keep the shared spring's acceleration, but settle at the destination
-    // instead of crossing it and rebounding as the scroll comes to rest.
-    let next = target + offset;
-    let bounded = next.clamp(y.min(target), y.max(target));
-    (bounded, if bounded == next { velocity } else { 0.0 })
+    /// The line under the bubble saying what the editor sent along, as the
+    /// accepted row will show it; empty when it sent nothing.
+    pub attached: String,
 }
 
 #[derive(Default)]
 pub struct SendMotion {
     pub pending: VecDeque<Pending>,
-    pub flight: Option<Flight>,
+    /// The transcript is rising under a message just sent, at
+    /// [`SCROLL_RATE`].
+    pub glide: bool,
     pub anchor: Option<SharedString>,
     pub anchor_offset: Option<f32>,
     pub room: f32,
@@ -75,19 +38,13 @@ pub struct SendMotion {
 }
 
 impl SendMotion {
-    pub fn start(&mut self, text: String, origin: f32, reduced: bool) {
+    pub fn start(&mut self, text: String, attached: String, reduced: bool) {
         self.sequence += 1;
         let id: SharedString = format!("pending-send-{}", self.sequence).into();
         self.anchor = Some(id.clone());
         self.anchor_offset = None;
-        self.flight = (!reduced).then(|| Flight {
-            id: id.clone(),
-            text: text.clone(),
-            y: origin,
-            velocity: 0.0,
-            tick: Instant::now(),
-        });
-        self.pending.push_back(Pending { id, text });
+        self.glide = !reduced;
+        self.pending.push_back(Pending { id, text, attached });
     }
 
     /// Transfer the presentation identity when the backend accepts a prompt.
@@ -97,11 +54,6 @@ impl SendMotion {
         };
         if self.anchor.as_ref() == Some(&pending.id) {
             self.anchor = Some(id.to_string().into());
-        }
-        if let Some(flight) = &mut self.flight {
-            if flight.id == pending.id {
-                flight.id = id.to_string().into();
-            }
         }
     }
 
@@ -169,49 +121,31 @@ mod tests {
         assert!(state.room_with_fold(200.0) < tight);
     }
 
+    /// The transcript rises under a sent message faster than it follows a
+    /// streaming reply.
     #[test]
-    fn flight_preserves_velocity_as_the_destination_scrolls() {
-        let (mut y, mut velocity) = (700.0, 0.0);
-        for frame in 0..120 {
-            let target = 500.0 - (frame as f32 * 12.0).min(440.0);
-            (y, velocity) = advance(y, velocity, target, 1.0 / 60.0, false);
-            assert!(y.is_finite() && velocity.is_finite());
-            assert!(
-                y >= target,
-                "the message must not overshoot its destination"
-            );
-        }
-        assert!((y - 60.0).abs() < 0.5);
-        assert_eq!(advance(y, velocity, 40.0, 0.016, true), (40.0, 0.0));
-    }
-
-    /// The transcript rises under a sent message about as fast as the message
-    /// flies: most of the rise is done within the flight's span, so the
-    /// message does not hang at its landing waiting for the scroll.
-    #[test]
-    fn the_rise_keeps_pace_with_the_flight() {
-        let mut spring = crate::transcript::StickSpring::default();
+    fn the_rise_outpaces_a_streaming_follow() {
         let rise = 600.0;
-        let frames = FLIGHT.total().as_secs_f32() * 1000.0 / crate::theme::SPRING_FRAME_MS;
-        let mut pos = 0.0;
-        for _ in 0..frames.ceil() as usize {
-            pos = spring.step(pos, rise, SCROLL_RATE);
-        }
-        assert!(
-            pos >= 0.9 * rise,
-            "only {pos}px of {rise}px risen when the message lands"
-        );
+        let risen = |rate: f32| {
+            let mut spring = crate::transcript::StickSpring::default();
+            let mut pos = 0.0;
+            for _ in 0..12 {
+                pos = spring.step(pos, rise, rate);
+            }
+            pos
+        };
+        assert!(risen(SCROLL_RATE) > risen(1.0));
+        assert!(risen(SCROLL_RATE) <= rise);
     }
 
     #[test]
     fn rapid_sends_keep_the_latest_anchor_when_earlier_prompts_arrive() {
         let mut state = SendMotion::default();
-        state.start("first".into(), 700.0, false);
-        state.start("second".into(), 700.0, false);
+        state.start("first".into(), String::new(), false);
+        state.start("second".into(), String::new(), false);
         state.accept("first-durable");
         assert_eq!(state.anchor.as_deref(), Some("pending-send-2"));
         state.accept("second-durable");
         assert_eq!(state.anchor.as_deref(), Some("second-durable"));
-        assert_eq!(state.flight.as_ref().unwrap().id, "second-durable");
     }
 }

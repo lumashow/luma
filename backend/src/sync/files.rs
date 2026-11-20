@@ -548,6 +548,7 @@ pub async fn download_pending_album_art(
             &format!("art {}", row.id),
             &mut stats.errors,
             |_| {
+                std::fs::create_dir_all(&art_dir)?;
                 let ext = crate::storage::art_extension(row.album_art_mime.as_deref());
                 Ok(art_dir.join(format!("{}.{ext}", row.track_hash)))
             },
@@ -573,4 +574,69 @@ pub async fn download_pending_album_art(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::local::{auth, database};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A device that only syncs has never imported or analyzed a track, so
+    /// nothing else has made `tracks/art` yet. Its cover art lands anyway.
+    #[tokio::test]
+    async fn album_art_downloads_into_fresh_storage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nart")
+                .await
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let pool = database::init_app_db_at(directory.path()).await.unwrap().0;
+        sqlx::query(
+            "INSERT INTO tracks (id, uid, track_hash, title, file_path, album_art_storage_path, album_art_mime)
+             VALUES ('track', 'alice', 'hash', 'Remote track', 'hash.stub', 'track-audio/alice/hash/cover.jpg', 'image/jpeg')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        auth::arm_write_admission(&pool, Some("alice"))
+            .await
+            .unwrap();
+        let storage = StorageRoot::from_path(directory.path().join("library"));
+        assert!(!storage.art_dir().exists());
+        let mut stats = FileSyncStats::default();
+
+        download_pending_album_art(
+            &pool,
+            &Storage::new(url, "test-key".into()),
+            &storage,
+            "token",
+            &mut stats,
+            &crate::sync::progress::Progress::default(),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.errors, Vec::<String>::new());
+        assert_eq!(stats.art_downloaded, 1);
+        let path: String =
+            sqlx::query_scalar("SELECT album_art_path FROM tracks WHERE id = 'track'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(std::path::Path::new(&path).starts_with(storage.art_dir()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"art");
+    }
 }

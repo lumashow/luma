@@ -1923,7 +1923,24 @@ looks = ref.looks()
 assert "Snare: 2x color add, 1 beats, on all" in looks, looks
 assert "all: the whole rig: Floor 1x, Snare 2x" in ref.roles(), ref.roles()
 assert ref.look("Snare").at == ("1.2.1", "1.3.1"), ref.look("Snare").at
-assert ref.venue.name and isinstance(ref.venue.groups(), tuple)
+assert ref.venue.name and isinstance(ref.venue.describe(), str)
+# A reference renders through its own hosts, on its own track's bars.
+window = ref.window(bars=(1, 3))
+assert window.at == ("1.1.1", "3.1.1"), window.at
+assert window.output.values.shape[1] > 0
+strip = window.filmstrip(frames=2, width=160, height=90)
+assert [ax.get_title() for ax in strip.axes] == ["1.1.1", "2.1.1"], strip.axes
+for write in ("venue.place", "track.score_apply"):
+    try:
+        ref._call(write, {})
+        raise AssertionError(f"a reference answered {write}")
+    except LumaHostCallError as error:
+        assert "read-only" in str(error), str(error)
+try:
+    luma.track._call("track.scores_read", {"score": "theirs", "method": "venue.describe", "payload": {}})
+    raise AssertionError("another person's score was read")
+except LumaHostCallError as error:
+    assert "only your own" in str(error), str(error)
 try:
     luma.scores.open("theirs")
     raise AssertionError("another person's score opened")

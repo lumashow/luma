@@ -917,7 +917,7 @@ def build_namespace(
             if host_call is not None:
                 from .scores import Scores
 
-                items["scores"] = Scores(items["track"])
+                items["scores"] = Scores(items["track"], figures)
 
     # Clip graphs: the builders under luma.clip, the shipped presets under
     # luma.presets. The builders read the installed preset names.
@@ -1023,7 +1023,7 @@ def reconcile_facades(namespace, previous):
             # The facade above is the one that stays live across cells.
             from .scores import Scores
 
-            items["scores"] = Scores(items["track"])
+            items["scores"] = Scores(items["track"], items["scores"]._figures)
 
     snapshot = namespace.get("venue")
     before = previous.get("venue") if previous is not None else None

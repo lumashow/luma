@@ -232,7 +232,12 @@ pub fn rail(tools: &[&ToolPart], ctx: &RowCtx, window: &Window, cx: &mut gpui::A
         .flex_none()
         .flex_col()
         .min_w_0()
-        .children(tools.iter().map(|tool| row(tool, ctx, window, cx)).collect::<Vec<_>>())
+        .children(
+            tools
+                .iter()
+                .map(|tool| row(tool, ctx, window, cx))
+                .collect::<Vec<_>>(),
+        )
         .into_any_element()
 }
 
@@ -284,11 +289,18 @@ pub fn card_height(tool: &ToolPart, cell: Option<&Cell>) -> f32 {
 /// window; not creating the replay in the first place is cheaper and cannot
 /// drift.
 fn openness(open: bool, fold: Option<f32>) -> f32 {
-    match fold {
-        Some(progress) if open => progress,
-        Some(progress) => 1.0 - progress,
-        None => f32::from(u8::from(open)),
-    }
+    fold.unwrap_or(f32::from(u8::from(open)))
+}
+
+/// How open a folding card is `elapsed_ms` after its click: from how open it
+/// was at the click toward its new state, easing out over
+/// [`theme::TOOL_FOLD_MS`]. A click on a card still folding turns it round
+/// from where it is.
+#[must_use]
+pub fn fold_openness(from: f32, open: bool, elapsed_ms: f32) -> f32 {
+    let t = (elapsed_ms / theme::TOOL_FOLD_MS).clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - t).powi(3);
+    from + (f32::from(u8::from(open)) - from) * eased
 }
 
 /// Which of a delegation's three ends a chip is showing.
@@ -542,30 +554,29 @@ fn row(tool: &ToolPart, ctx: &RowCtx, window: &Window, cx: &mut gpui::App) -> An
         .into_any_element()
 }
 
-/// The header a compact turn's work folds behind: a chip-height row with the
-/// turn's state and a chevron, whose click opens or closes the work.
+/// The header a run of a compact turn's work folds behind: a chip-height row
+/// with the run's state and a chevron, whose click opens or closes the work.
+/// `id` names the run ([`crate::transcript::work_key`]).
 ///
 /// Shaped like a tool chip — the same height, hover and chevron — because it
 /// is the same kind of control: a summary line that opens what it summarises.
 pub fn work_header(
     label: &str,
     open: bool,
-    message: &luma_lib::agent::AgentChatMessage,
+    id: SharedString,
+    running: bool,
     ctx: &RowCtx,
     cx: &mut gpui::App,
 ) -> AnyElement {
     let theme = ctx.theme;
     let chat = ctx.chat.clone();
-    let id = SharedString::from(message.id.clone());
     let row_ix = ctx.ix;
-    let phase = ctx
-        .live
-        .then(|| luma_ui::motion::pulse_delta(&SHIMMER, ctx.chat.entity_id(), cx));
+    let phase = running.then(|| luma_ui::motion::pulse_delta(&SHIMMER, ctx.chat.entity_id(), cx));
     let parts = Label {
         verb: label.to_string(),
         detail: None,
         failed: false,
-        running: ctx.live,
+        running,
     };
     div()
         .id(SharedString::from(format!("chat-work-{id}")))
@@ -638,9 +649,8 @@ fn two_tone(parts: &Label, phase: Option<f32>, theme: &Theme) -> gpui::StyledTex
     let chars = text.char_indices().collect::<Vec<_>>();
     // The band starts before the first character and ends after the last,
     // so each pass enters and leaves the label rather than jumping in it.
-    let center = phase.map(|phase| {
-        phase * (chars.len() as f32 + 2.0 * SHIMMER_BAND) - SHIMMER_BAND
-    });
+    let center =
+        phase.map(|phase| phase * (chars.len() as f32 + 2.0 * SHIMMER_BAND) - SHIMMER_BAND);
     let highlights = chars
         .iter()
         .enumerate()
@@ -918,12 +928,29 @@ mod tests {
         // is the case a virtualized list hits on every scroll-back-into-view.
         assert_eq!(openness(true, None), 1.0);
         assert_eq!(openness(false, None), 0.0);
-        // Mid-fold: opening walks up, closing walks down.
+        // Mid-fold it is wherever the fold says, whichever way it is set.
         assert_eq!(openness(true, Some(0.25)), 0.25);
-        assert_eq!(openness(false, Some(0.25)), 0.75);
-        // Both directions still land exactly on their endpoints.
-        assert_eq!(openness(true, Some(1.0)), 1.0);
-        assert_eq!(openness(false, Some(1.0)), 0.0);
+        assert_eq!(openness(false, Some(0.25)), 0.25);
+    }
+
+    /// A fold starts where the card was and ends on its new state, moving
+    /// one way throughout; turned round mid-fold, it carries on from where
+    /// it had got to instead of jumping to an end first.
+    #[test]
+    fn a_fold_runs_from_where_the_card_was() {
+        let span = theme::TOOL_FOLD_MS;
+        assert_eq!(fold_openness(0.0, true, 0.0), 0.0);
+        assert_eq!(fold_openness(0.0, true, span), 1.0);
+        assert_eq!(fold_openness(1.0, false, span * 2.0), 0.0);
+        let mut last = 0.0;
+        for step in 1..=10 {
+            let now = fold_openness(0.0, true, span * step as f32 / 10.0);
+            assert!(now > last);
+            last = now;
+        }
+        let midway = fold_openness(0.0, true, span / 3.0);
+        assert_eq!(fold_openness(midway, false, 0.0), midway);
+        assert!(fold_openness(midway, false, span / 3.0) < midway);
     }
 
     /// The chip is titled by the model's own verb, in the tense of the call's

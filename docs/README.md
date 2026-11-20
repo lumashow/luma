@@ -50,7 +50,6 @@ works and the decisions behind it.
 ## App shell
 
 - [specs/comet-shell.md](specs/comet-shell.md) — the shell's contract: modes, per-venue state, the song list, chrome, surfaces
-- [specs/agent-chat-gpui.md](specs/agent-chat-gpui.md) — the agent chat panel
 
 ## Agent
 

@@ -44,9 +44,21 @@ add impact at the peak; you can only avoid spending it early.
   how often it does it. The music sets the number: a track with one true
   peak gets the move once, a relentless one can live there for a whole
   drop. Spending it where the music did not peak halves it everywhere.
-- **Darkness needs safety.** Near-black, not literal zero, for anything longer
-  than a beat — one ember somewhere keeps the room from reading "power cut."
-  Unless "power cut" is the effect, in which case commit fully and briefly.
+- **Black is the loudest thing you have.** A room that has been truly dark
+  for a bar feels the next hit in its body; a room that was dim only sees it.
+  So go all the way to zero, on every light, when the music leaves a hole —
+  between the stabs of a chase, in the gap before a drop, on the 16th the
+  bass cuts. Leaving an ember on "to be safe" is how a show ends up grey: the
+  eye adapts to the ember and the hits lose their edge.
+- **White is a decision.** White is every color at once and the brightest
+  thing the rig does, so a show that drifts to white has nowhere left to go.
+  Reach for it when the sound is white — a crash, a noise sweep, a snare like
+  a gunshot — and come back off it as fast as the sound does.
+- **Commit to the hit.** When the sub is hitting the crowd in the chest, do
+  the same thing to their eyes: a strobe at full on the bar that deserves
+  it, a pulse with a hard front edge exactly on the grid. A hit at 60% says
+  you were not sure the sound was there, so go back and dig deeper into the
+  frequencies until you are sure, then hit it like you mean it.
 
 ## Diagnosis
 

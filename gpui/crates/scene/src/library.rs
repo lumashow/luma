@@ -88,22 +88,29 @@ fn bracket(built: &Built) -> Option<usize> {
         .position(|j| j.kind == JointKind::Tilt && j.drive == Drive::Manual && j.element.is_none())
 }
 
-/// A placed fixture's frames with its own aim on its bracket.
+/// A placed fixture's frames with its own aim on the joints it has for it.
 ///
 /// The solve turns a placed fixture's pose by its `[pan, tilt]` aim (radians)
-/// off the mount, as a whole, which is right for anything without a bracket:
-/// a mover is aimed by its motors on top of that, and a box has nothing else
-/// to turn. A fixture with a hand-set tilt keeps its bracket on the clamp and
-/// leans its head in it, so here the tilt half of the aim comes back out of
-/// the pose and goes onto the bracket's joint instead. The beam points the
-/// same way either way; only what is drawn turning differs.
+/// off the mount, as a whole, which is right for a box: it has nothing else to
+/// turn. A fixture with joints keeps its base on its mount and turns what the
+/// joints turn, so here the aim comes back out of the pose and goes onto the
+/// joints instead:
+///
+/// - a hand-set tilt keeps its bracket on the clamp and leans its head in it,
+///   so the tilt half of the aim goes onto the bracket's joint;
+/// - a moving head keeps its base flat and its yoke and head turn to where
+///   the aim and the motors together point it ([`on_motors`]).
+///
+/// The beam points the same way either way; only what is drawn turning
+/// differs.
 ///
 /// Returns what to post-multiply the pose by, and every node's frame.
 #[must_use]
 pub fn aimed(built: &Built, heads: &[[f32; 2]], aim: [f32; 2]) -> (Mat4, Vec<Mat4>) {
     let mut angles = angles(built, heads);
     let Some(i) = bracket(built).filter(|_| aim[1] != 0.0) else {
-        return (Mat4::IDENTITY, built.world_matrices(&angles));
+        return on_motors(built, &angles, aim)
+            .unwrap_or_else(|| (Mat4::IDENTITY, built.world_matrices(&angles)));
     };
     // The tilt half of the solve's turn, in housing space: a turn about
     // housing X, spelled exactly as the solve spells it.
@@ -120,6 +127,72 @@ pub fn aimed(built: &Built, heads: &[[f32; 2]], aim: [f32; 2]) -> (Mat4, Vec<Mat
         Mat4::from_mat3(tilt).inverse(),
         built.world_matrices(&angles),
     )
+}
+
+/// A moving head's frames with its aim on its own pan and tilt motors, or
+/// [`None`] when the fixture is not one or is not aimed.
+///
+/// `angles` are the joint angles the motors are already at. The aim turns the
+/// whole fixture in the solve, so the beam it asks for is that turn applied to
+/// where the motors point. With the base back on its mount the same beam is
+/// one pan and one tilt, and they are solved for here against the build's own
+/// joints, so no convention about which way a spec's motors turn is restated.
+/// The solve starts from the aim added to the motors, which is the answer
+/// whenever the motors are at rest, and takes a few damped Newton steps from
+/// there. A beam the two joints cannot reach is left to the whole-body turn.
+fn on_motors(built: &Built, angles: &[f32], aim: [f32; 2]) -> Option<(Mat4, Vec<Mat4>)> {
+    if aim == [0.0; 2] {
+        return None;
+    }
+    let pan = own_joint(built, JointKind::Pan)?;
+    let tilt = own_joint(built, JointKind::Tilt)?;
+    let turn = crate::coords::swapped_basis(fixture_kinematics::articulation_basis_d(
+        f64::from(aim[0]),
+        f64::from(aim[1]),
+    ))
+    .as_mat3();
+    let mut angles = angles.to_vec();
+    let from = [angles[pan], angles[tilt]];
+    let mut along = |at: [f32; 2]| {
+        angles[pan] = at[0];
+        angles[tilt] = at[1];
+        beam(built, &built.world_matrices(&angles), 0).map(|(_, along)| along)
+    };
+    let want = turn * along(from)?;
+    let mut at = [
+        from[0] + sign(built, pan) * aim[0].to_degrees(),
+        from[1] + sign(built, tilt) * aim[1].to_degrees(),
+    ];
+    const STEP_DEG: f32 = 0.5;
+    const CLOSE: f32 = 1e-4;
+    for _ in 0..12 {
+        let here = along(at)?;
+        let miss = want - here;
+        if miss.length() < CLOSE {
+            break;
+        }
+        let by_pan = (along([at[0] + STEP_DEG, at[1]])? - here) / STEP_DEG;
+        let by_tilt = (along([at[0], at[1] + STEP_DEG])? - here) / STEP_DEG;
+        // Damped least squares: with the head along the pan axis a pan turns
+        // nothing, and the damping leaves it where it is.
+        let damp = 1e-8;
+        let (a, b, d) = (
+            by_pan.dot(by_pan) + damp,
+            by_pan.dot(by_tilt),
+            by_tilt.dot(by_tilt) + damp,
+        );
+        let (p, t) = (by_pan.dot(miss), by_tilt.dot(miss));
+        let det = a * d - b * b;
+        at[0] += ((d * p - b * t) / det).clamp(-45.0, 45.0);
+        at[1] += ((a * t - b * p) / det).clamp(-45.0, 45.0);
+    }
+    if (want - along(at)?).length() > 10.0 * CLOSE {
+        return None;
+    }
+    Some((
+        Mat4::from_mat3(turn).inverse(),
+        built.world_matrices(&angles),
+    ))
 }
 
 /// Every node's housing-space frame with each head at its own `[pan, tilt]`
@@ -228,6 +301,52 @@ mod tests {
 
     fn sharpy() -> Built {
         spec("claypaky/sharpy")
+    }
+
+    /// A mover standing on a floor with a rest aim keeps its base on the
+    /// floor: the whole of the aim comes back out of the pose, and the head
+    /// still points where the aim and the motors together say.
+    #[test]
+    fn an_aimed_mover_keeps_its_base_flat_and_its_beam() {
+        let b = sharpy();
+        for aim in [
+            [0.3, 0.9],
+            [-0.23, 1.26],
+            [1.2, -0.4],
+            [0.0, 0.7],
+            [0.8, 0.0],
+        ] {
+            for motors in [[0.0, 0.0], [40.0, 25.0], [-110.0, 60.0]] {
+                let whole = worlds(&b, &[motors]);
+                let (_, turned) = beam(&b, &whole, 0).unwrap();
+                let turn = crate::coords::swapped_basis(fixture_kinematics::articulation_basis_d(
+                    f64::from(aim[0]),
+                    f64::from(aim[1]),
+                ))
+                .as_mat3();
+                let (back, frames) = aimed(&b, &[motors], aim);
+                assert!(
+                    (Mat4::from_mat3(turn) * back).abs_diff_eq(Mat4::IDENTITY, 1e-5),
+                    "{aim:?} {motors:?}: the base is still turned"
+                );
+                // Under the pose, which carries the turn, the drawn beam is
+                // the one the solve asked for.
+                let (_, drawn) = beam(&b, &frames, 0).unwrap();
+                assert!(
+                    (drawn - turn * turned).length() < 2e-3,
+                    "{aim:?} {motors:?}: {drawn:?} vs {:?}",
+                    turn * turned
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unaimed_mover_is_posed_by_its_motors_alone() {
+        let b = sharpy();
+        let (back, frames) = aimed(&b, &[[30.0, 45.0]], [0.0; 2]);
+        assert_eq!(back, Mat4::IDENTITY);
+        assert_eq!(frames, worlds(&b, &[[30.0, 45.0]]));
     }
 
     /// Each cell's centre under `worlds`, in housing space.

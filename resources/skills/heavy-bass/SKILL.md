@@ -28,6 +28,14 @@ light what you measured.
 - The fastest strobe belongs to the phrase whose measured rate is actually
   fastest. Save it for that phrase.
 
+This music is physical. On the drop the sub is hitting the crowd in the
+chest, and the light's job is to do the same thing to their eyes. Do not
+accompany the bass: fuck the room with it. Full, hard, on the hit, then
+gone. Strobes on the deepest notes are not a risk here, they are the point.
+If you catch yourself hedging at 60%, you did not believe the sound, so you
+must dig deeper into the frequencies until you know exactly what it is doing,
+and then commit to it completely.
+
 ## Feel
 
 - Halftime drums: at 140 the snare lands every fourth felt beat, so the
@@ -85,13 +93,12 @@ Depth: maximum. Intricate detail that mirrors the audio is the product here.
 - Listen for: the growl's rate and every rate switch, scoops (pitch or
   filter? check), womps per bar, cuts where the bass drops out for a 16th, and
   what the second half of a 2-bar phrase changes.
-- Detail: 16th resolution on every drop phrase. Run the full loop, the
-  skeptic pass, and parallel listeners (bass, drums and cuts, vocals,
-  transitions) on each distinct drop phrase.
+- Detail: 16th resolution on every drop phrase. Run the full loop and the
+  skeptic pass on each distinct drop phrase, once for each aspect: bass,
+  drums and cuts, vocals, transitions.
 - LDs love: a light that switches rate exactly when the LFO does, and a
   blackout on the one 16th the bass cuts.
 
-To design, map sections and fix palette and group roles yourself, then give
-each child one drop phrase with the bass evidence rows and your arc decisions
-in its brief. Stitch, walk the seams, and confirm the drops outrank everything
-else on the heatmap.
+To design, map sections and fix palette and group roles first, then build one
+drop phrase at a time from its bass evidence rows. Walk the seams, and confirm
+the drops outrank everything else on the heatmap.

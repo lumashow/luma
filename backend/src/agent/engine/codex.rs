@@ -96,7 +96,7 @@ impl Session {
                         .and_then(Value::as_str)
                         != Some("chatgpt")
                     {
-                        return Err(protocol("Codex subscription execution requires `codex login` with ChatGPT on this machine"));
+                        return Err(protocol(super::auth::SIGNED_OUT_CODEX));
                     }
                     self.process
                         .send(json!({"id":5,"method":"config/read","params":{}}))
@@ -230,10 +230,16 @@ impl Session {
                         }
                         return self.finish_turn().await;
                     }
+                    if refused_login(&params["turn"]["error"]) {
+                        return Err(protocol(super::auth::SIGNED_OUT_CODEX));
+                    }
                     return Err(protocol(format!(
                         "Codex turn did not complete: {}",
                         params["turn"]
                     )));
+                }
+                "error" if refused_login(&params["error"]) => {
+                    return Err(protocol(super::auth::SIGNED_OUT_CODEX));
                 }
                 "error" => return Err(protocol(format!("Codex: {}", params["error"]))),
                 _ if frame.get("method").is_some() && frame.get("id").is_some() => {
@@ -392,6 +398,32 @@ const CODEX: Cli = Cli {
     label: "Codex CLI",
 };
 
+// Adapted from Zeron, MIT, (c) 2026 Wing: `codex_error_text`.
+/// Whether a turn's `error` says the provider refused Codex's login. The
+/// structured `codexErrorInfo` decides it, not the prose: `"unauthorized"`,
+/// or a transport variant carrying the upstream status, which is how a
+/// missing or dead login fails (`httpConnectionFailed {httpStatusCode: 401}`).
+fn refused_login(error: &Value) -> bool {
+    let info = &error["codexErrorInfo"];
+    info == "unauthorized"
+        || info.get("unauthorized").is_some()
+        || info
+            .as_object()
+            .into_iter()
+            .flat_map(|variant| variant.values())
+            .any(|detail| detail["httpStatusCode"] == 401)
+}
+
+/// The CLI's own ChatGPT sign-in. It opens the browser and exits once the
+/// login is saved.
+pub(super) fn sign_in_command(
+    cwd: &std::path::Path,
+) -> Result<tokio::process::Command, AgentError> {
+    let mut cmd = command(CODEX, cwd)?;
+    cmd.args(["login", "-c", "forced_login_method=\"chatgpt\""]);
+    Ok(cmd)
+}
+
 fn start_process(cwd: &std::path::Path) -> Result<Process, AgentError> {
     let mut cmd = command(CODEX, cwd)?;
     cmd.args(["app-server", "--stdio"]);
@@ -498,6 +530,53 @@ pub(super) async fn models(
     }
 }
 
+/// Ask a fresh app server one question, as the model list is asked.
+async fn ask(cwd: &std::path::Path, method: &str) -> Result<Value, AgentError> {
+    let mut process = start_process(cwd)?;
+    initialize(&mut process).await?;
+    loop {
+        let frame = process.read().await?;
+        if let Some(error) = frame.get("error") {
+            return Err(protocol(format!("Codex: {error}")));
+        }
+        match frame.get("id").and_then(Value::as_u64) {
+            Some(1) => {
+                process.send(json!({"method":"initialized"})).await?;
+                process
+                    .send(json!({"id":6,"method":method,"params":{}}))
+                    .await?;
+            }
+            Some(6) => return Ok(frame["result"].clone()),
+            _ => {}
+        }
+    }
+}
+
+/// What `account/rateLimits/read` answers: the plan's windows and how much of
+/// each is used.
+pub(super) async fn rate_limits(cwd: &std::path::Path) -> Result<Value, AgentError> {
+    ask(cwd, "account/rateLimits/read").await
+}
+
+/// The ChatGPT account the CLI is signed in to, if it is.
+pub(super) async fn account(
+    cwd: &std::path::Path,
+) -> Result<Option<super::providers::Account>, AgentError> {
+    let account = ask(cwd, "account/read").await?["account"].take();
+    Ok(
+        (account["type"] == "chatgpt").then(|| super::providers::Account {
+            name: account["email"].as_str().map(str::to_string),
+            plan: account["planType"]
+                .as_str()
+                .map(|plan| format!("ChatGPT {}", super::providers::plan_name(plan))),
+        }),
+    )
+}
+
+pub(super) async fn version(cwd: &std::path::Path) -> Option<String> {
+    super::providers::version_output(command(CODEX, cwd).ok()?).await
+}
+
 /// Move the first of `defaults` that `models` lists to the top.
 fn first(models: &mut Vec<super::catalog::ModelChoice>, defaults: [Option<String>; 2]) {
     let at = defaults
@@ -602,6 +681,25 @@ mod tests {
         assert_eq!(lead([None, Some("recommended")]), "recommended");
         assert_eq!(lead([Some("unlisted"), Some("recommended")]), "recommended");
         assert_eq!(lead([None, None]), "listed-first");
+    }
+
+    /// A login the provider refuses is told by the error's structure; a
+    /// message that merely mentions one is not.
+    #[test]
+    fn a_refused_login_is_told_by_structure() {
+        for error in [
+            json!({"message":"x","codexErrorInfo":"unauthorized"}),
+            json!({"message":"x","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":401}}}),
+        ] {
+            assert!(refused_login(&error), "{error}");
+        }
+        for error in [
+            json!({"message":"unauthorized tool","codexErrorInfo":"other"}),
+            json!({"message":"x","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":429}}}),
+            Value::Null,
+        ] {
+            assert!(!refused_login(&error), "{error}");
+        }
     }
 
     /// The picker's Codex window is the one a turn reports: 272,000 at 95%

@@ -1,6 +1,7 @@
-// Compact turns: a finished turn's work (narration, tool calls) folds behind
-// one "Worked for" header and the final reply stays visible under it. Opening
-// the header shows the work as ordinary rows; closing it hides them again.
+// Compact turns: a finished turn's tool calls fold behind a "Worked for"
+// header, and everything the turn wrote stays visible around it: the
+// narration above, the final reply below. Opening the header shows the calls
+// as ordinary rows; closing it hides them again.
 
 const OPENING = "Sampling the ramp first.";
 const CLOSING = "The ramp peaks at bar 3.";
@@ -67,7 +68,11 @@ test("a settled turn folds its work behind a header and opens on a click", () =>
 
   const folded = until("the settled, folded turn", (s) => header(s) && has(s, CLOSING) && !busy(s));
   assert(!toolChip(folded), "the tool call is still showing outside the header");
-  assert(!has(folded, OPENING), "the narration is still showing outside the header");
+  assert(has(folded, OPENING), "the narration was folded away with the tool call");
+  // What the turn wrote keeps its order around the fold.
+  const y = (s, line) => s.findAll({ role: "text" }).find((n) => n.label.includes(line)).bounds.y;
+  expect(y(folded, OPENING)).toBeLessThan(header(folded).bounds.y);
+  expect(header(folded).bounds.y).toBeLessThan(y(folded, CLOSING));
 
   app.click(header(folded));
   const opened = until("the work", (s) => toolChip(s) && has(s, OPENING));
@@ -80,4 +85,5 @@ test("a settled turn folds its work behind a header and opens on a click", () =>
   app.click(header(opened));
   const closed = until("the work to fold away", (s) => !toolChip(s) && header(s));
   assert(has(closed, CLOSING), "the final reply left with the fold");
+  assert(has(closed, OPENING), "the narration left with the fold");
 });

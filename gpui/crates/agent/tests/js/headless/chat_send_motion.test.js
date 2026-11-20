@@ -1,5 +1,6 @@
-// Sending, as motion: the prompt lifts from the composer, lands near the top
-// of the conversation and stays there while the reply fills the room. The
+// Sending, as motion: the prompt is a row of the conversation from the moment
+// it is sent, and the conversation glides it to near the top, where it stays
+// while the reply fills the room. Nothing is drawn over the conversation. The
 // working trailer shows from the send's first frame and does not move once
 // the prompt has landed.
 //
@@ -20,7 +21,7 @@ fixture({
   ],
 });
 
-const flying = (s) => s.find({ role: "card", label: "Sending message" });
+const prompt = (s, text) => s.findAll({ role: "text" }).find((n) => n.label === text);
 // A turn in flight turns Send into Steer, so Send is the idle composer.
 const idle = (s) => !busy(s) && s.find({ role: "button", label: "Send" }) !== undefined;
 
@@ -44,21 +45,27 @@ test("in the app shell a sent prompt stays on screen once it lands", () => {
 
   send("Make it warmer");
   // The indicator does not wait for the motion: every frame the send drew
-  // with the prompt in flight already says the panel is working.
-  const sent = app.painted().filter((s) => flying(s));
-  assert(sent.length > 0, "the send drew no frame with the prompt in flight");
+  // with the prompt on screen already says the panel is working.
+  const WARMER = "Make it warmer";
+  const sent = app.painted().filter((s) => prompt(s, WARMER));
+  assert(sent.length > 0, "the send drew no frame with the prompt in the conversation");
   for (const s of sent) assert(busy(s), "the working indicator waited for the message to land");
-  const start = flying(until("the prompt in flight", flying));
-  const middle = flying(until("the prompt to lift", (s) =>
-    flying(s) && flying(s).bounds.y < start.bounds.y));
+  // The prompt rises in the conversation: it glides, it does not jump there.
+  const start = prompt(until("the sent prompt", (s) => prompt(s, WARMER)), WARMER);
+  const middle = prompt(until("the prompt to rise", (s) =>
+    prompt(s, WARMER) && prompt(s, WARMER).bounds.y < start.bounds.y), WARMER);
   expect(middle.bounds.y).toBeLessThan(start.bounds.y);
-  const settled = until("the message to land", (s) => !flying(s));
+  const viewport = app.snapshot().find({ role: "card", label: "Conversation" }).bounds;
+  const settled = until("the message to land", (s) =>
+    prompt(s, WARMER) && prompt(s, WARMER).bounds.y - viewport.y < viewport.height / 4);
 
-  // It lands near the top of the conversation, not at the bottom.
-  const viewport = settled.find({ role: "card", label: "Conversation" }).bounds;
-  const prompt = settled.findAll({ role: "text" }).find((n) => n.label === "Make it warmer");
-  assert(prompt, "the landed prompt is not on screen");
-  expect(prompt.bounds.y - viewport.y).toBeLessThan(viewport.height / 4);
+  // It lands near the top of the conversation, not at the bottom, and no
+  // copy of it is drawn over the conversation on the way.
+  const landed = prompt(settled, WARMER);
+  expect(landed.bounds.y - viewport.y).toBeLessThan(viewport.height / 4);
+  for (const s of app.painted()) {
+    expect(s.findAll({ role: "text" }).filter((n) => n.label === WARMER).length).toBeLessThan(2);
+  }
 
   // Once the reply's text has stopped growing the trailer holds still while
   // the model keeps thinking. The trailer is up from the send, so it moves
@@ -75,5 +82,5 @@ test("in the app shell a sent prompt stays on screen once it lands", () => {
 
   // A reply taller than the room still lands its prompt.
   send("Show every cue");
-  until("the long reply", (s) => !flying(s) && idle(s) && texts(s).some((l) => l.includes("softly lit")));
+  until("the long reply", (s) => idle(s) && texts(s).some((l) => l.includes("softly lit")));
 });

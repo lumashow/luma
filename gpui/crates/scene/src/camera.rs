@@ -137,6 +137,13 @@ impl Camera {
     /// distance being solved for, so the closed form does not apply; the
     /// distance along the floor is bisected against [`Framing::fits`] instead.
     ///
+    /// A body also stands *somewhere a body can*. Neither standing view goes
+    /// behind a wall of the room ([`Framing::in_room`]), and the audience
+    /// stands on the dance floor: the first clear stretch of floor in front of
+    /// the booth, which keeps it inside a rig that surrounds the crowd — see
+    /// [`dance_floor`]. Where that is too close to see the whole rig, the lens
+    /// widens instead, up to [`STANDING_MAX_FOV_DEG`] — see [`Self::standing`].
+    ///
     /// `dj` stands *at least* as far back as the booth, and further when the
     /// booth is not far enough. A booth is usually a metre from the nearest
     /// fixture and often between them, so taking it literally puts the eye
@@ -172,18 +179,8 @@ impl Camera {
             let (sa, ca) = azimuth.sin_cos();
             Vec3::new(sp * ca, sp * sa, cp)
         };
-        // A body standing on the floor, `at_least` metres out along `azimuth`
-        // and further if that is not far enough to see the rig, aimed so the
-        // chrome does not eat it.
         let target = framing.target();
-        let standing = |azimuth: f32, at_least: f32| {
-            let eye_z = framing.floor_z() + EYE_HEIGHT_M;
-            let standoff =
-                standing_standoff(framing, target, azimuth, eye_z, view_finder).max(at_least);
-            let (sa, ca) = azimuth.sin_cos();
-            let eye = Vec3::new(target.x + standoff * ca, target.y + standoff * sa, eye_z);
-            Self::aimed_from(framing, eye, target, view_finder)
-        };
+        let walk = |azimuth: f32| Walk::new(target, azimuth);
         match view {
             View::Front => orbit(target, FRONT_EYE.normalize()),
             View::Overhead => plan(target, spherical(front_azimuth(), Framing::MIN_POLAR)),
@@ -191,15 +188,67 @@ impl Camera {
             View::QuarterRight => {
                 orbit(target, spherical(front_azimuth() + QUARTER, QUARTER_POLAR))
             }
-            View::Audience => standing(front_azimuth(), 0.0),
+            View::Audience => {
+                let walk = walk(front_azimuth());
+                let floor = dance_floor(framing, &walk, booth);
+                Self::standing(framing, &walk, floor, view_finder)
+            }
             View::Dj => match booth {
                 Some(booth) => {
                     let out = (booth - target).truncate();
-                    standing(out.y.atan2(out.x), out.length())
+                    let walk = walk(out.y.atan2(out.x));
+                    let wall = walk.wall(framing).unwrap_or(f32::INFINITY);
+                    Self::standing(framing, &walk, (out.length(), wall), view_finder)
                 }
                 None => orbit(target, reversed(FRONT_EYE).normalize()),
             },
         }
+    }
+
+    /// A body standing on the floor along `walk`, between `near` and `far`
+    /// metres out from the framing target.
+    ///
+    /// It stands where the whole rig fits the frame when that is within the
+    /// range, and at the nearer end of the range otherwise. Closer than the
+    /// fit, the rig no longer fits the lens it was asked for, so the lens
+    /// widens to the narrowest one that does fit, and no wider than
+    /// [`STANDING_MAX_FOV_DEG`]: someone in a small room sees it wide. The eye
+    /// then looks level at the rig's height, no nearer than the rig's own
+    /// radius, so a body standing under the rig does not look straight up.
+    ///
+    /// `near` wins over `far`: a booth outside its own room is still where
+    /// the DJ stands.
+    fn standing(
+        framing: &Framing,
+        walk: &Walk,
+        (near, far): (f32, f32),
+        view: &Viewfinder,
+    ) -> Self {
+        let target = walk.origin;
+        let eye_z = framing.floor_z() + EYE_HEIGHT_M;
+        let fit = standing_standoff(framing, target, walk.azimuth(), eye_z, view);
+        let standoff = fit.min(far).max(near);
+        let eye = walk.at(standoff, eye_z);
+        if standoff >= fit {
+            return Self::aimed_from(framing, eye, target, view);
+        }
+        let ahead = walk.at(standoff - standoff.max(framing.radius()), target.z);
+        let lens = |fov_y_deg: f32| Viewfinder { fov_y_deg, ..*view };
+        let mut narrow = view.fov_y_deg;
+        let mut wide = STANDING_MAX_FOV_DEG.max(narrow);
+        if framing.fits(eye, ahead, &lens(wide)) {
+            for _ in 0..16 {
+                let mid = 0.5 * (narrow + wide);
+                if framing.fits(eye, ahead, &lens(mid)) {
+                    wide = mid;
+                } else {
+                    narrow = mid;
+                }
+            }
+        }
+        // Nudged out for the same reason the standoff is: see
+        // [`standing_standoff`].
+        Self::aimed_from(framing, eye, ahead, &lens(wide * (1.0 + BISECTION_SLACK)))
     }
 
     /// [`Camera::looking_from`], with the aim shifted so the chrome-free part
@@ -277,6 +326,167 @@ fn standing_standoff(
 
 /// See [`standing_standoff`].
 const BISECTION_SLACK: f32 = 1e-4;
+
+/// A straight line along the floor out of the framing target: the line a
+/// standing view backs away along.
+///
+/// A point is `along` metres out from the origin and `across` metres to the
+/// side, which is all the standing views need to know about the plan.
+struct Walk {
+    origin: Vec3,
+    out: Vec2,
+}
+
+impl Walk {
+    fn new(origin: Vec3, azimuth: f32) -> Self {
+        let (sin, cos) = azimuth.sin_cos();
+        Self {
+            origin,
+            out: Vec2::new(cos, sin),
+        }
+    }
+
+    fn azimuth(&self) -> f32 {
+        self.out.y.atan2(self.out.x)
+    }
+
+    /// The point `along` metres out, at height `z`.
+    fn at(&self, along: f32, z: f32) -> Vec3 {
+        (self.origin.truncate() + self.out * along).extend(z)
+    }
+
+    fn along(&self, point: Vec3) -> f32 {
+        (point - self.origin).truncate().dot(self.out)
+    }
+
+    fn across(&self, point: Vec3) -> f32 {
+        (point - self.origin).truncate().perp_dot(self.out)
+    }
+
+    /// How far out a body can stand before its back is against the room's
+    /// wall. [`None`] in open air, and when the walk does not start inside
+    /// the room.
+    fn wall(&self, framing: &Framing) -> Option<f32> {
+        let [width, depth, _] = framing.room()?;
+        let half = Vec2::new(width, depth) * 0.5;
+        let start = self.origin.truncate();
+        if start.abs().cmpgt(half).any() {
+            return None;
+        }
+        let exit = |start: f32, out: f32, half: f32| {
+            if out.abs() < 1e-6 {
+                f32::INFINITY
+            } else {
+                (half * out.signum() - start) / out
+            }
+        };
+        let reach = exit(start.x, self.out.x, half.x).min(exit(start.y, self.out.y, half.y));
+        Some((reach - WALL_CLEARANCE_M).max(0.0))
+    }
+}
+
+/// The stretch of floor the audience stands on, as the nearest and furthest a
+/// body may be from the framing target along `walk`.
+///
+/// Walk out from the booth — or from the middle of the rig when there is no
+/// booth — along the line the audience faces down. Whatever stands in the way
+/// at body height ends a stretch of floor: a deck, a tower, a speaker stack, a
+/// light on a floor stand. A truss overhead does not. The room's wall ends the
+/// last one. The dance floor is the first stretch at least
+/// [`DANCE_FLOOR_M`] long, or the longest there is when none is.
+///
+/// That one rule covers the three rooms that differ. A stage in a hall: the
+/// floor runs from the stage to the back wall, and the audience may back up to
+/// the wall and no further. A stage in a field: the floor has no far end, and
+/// the audience backs up until the rig fits. A rig that surrounds the crowd:
+/// the floor ends at the lights behind the crowd, so the audience stands
+/// inside the ring and not out in the field looking through it.
+///
+/// Only what is near the line counts ([`corridor`]), so the legs of a stage
+/// roof either side of the stage do not fence the crowd onto the stage.
+fn dance_floor(framing: &Framing, walk: &Walk, booth: Option<Vec3>) -> (f32, f32) {
+    let low = framing.floor_z() + STEP_M;
+    let high = framing.floor_z() + EYE_HEIGHT_M + HEADROOM_M;
+    let half_width = corridor(framing, walk);
+    let mut blocks: Vec<(f32, f32)> = framing
+        .solids()
+        .filter(|solid| solid.max.z > low && solid.min.z < high)
+        .filter_map(|solid| {
+            let corners = solid.corners();
+            let span = |of: &dyn Fn(Vec3) -> f32| {
+                corners
+                    .iter()
+                    .map(|&corner| of(corner))
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+                        (lo.min(v), hi.max(v))
+                    })
+            };
+            let (left, right) = span(&|p| walk.across(p));
+            let (near, far) = span(&|p| walk.along(p));
+            (left <= half_width && right >= -half_width).then_some((near - BODY_M, far + BODY_M))
+        })
+        .collect();
+    blocks.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let wall = walk.wall(framing).unwrap_or(f32::INFINITY);
+    let mut from = booth.map_or(0.0, |booth| walk.along(booth));
+    let mut longest = (from, from);
+    for (near, far) in blocks {
+        if far <= from {
+            continue;
+        }
+        let stretch = (from, near.min(wall));
+        if stretch.1 - stretch.0 >= DANCE_FLOOR_M {
+            return stretch;
+        }
+        if stretch.1 - stretch.0 > longest.1 - longest.0 {
+            longest = stretch;
+        }
+        from = far;
+    }
+    let last = (from, wall);
+    if last.1 - last.0 >= DANCE_FLOOR_M || last.1 - last.0 > longest.1 - longest.0 {
+        last
+    } else {
+        longest
+    }
+}
+
+/// Half the width of the strip of floor [`dance_floor`] reads, in metres: a
+/// share of the rig's width across the walk, and never narrower than a few
+/// people.
+fn corridor(framing: &Framing, walk: &Walk) -> f32 {
+    let size = framing.bounds().size().truncate();
+    let across = (size.x * walk.out.y).abs() + (size.y * walk.out.x).abs();
+    (across * CORRIDOR_SHARE).max(CORRIDOR_MIN_M)
+}
+
+/// Shortest stretch of clear floor that is a dance floor rather than a gap
+/// between two pieces of the stage, in metres.
+const DANCE_FLOOR_M: f32 = 4.0;
+
+/// Share of the rig's width, either side of the centre line, that has to be
+/// clear for the floor to count as clear. See [`corridor`].
+const CORRIDOR_SHARE: f32 = 0.15;
+
+/// …and the least that share may come to, in metres.
+const CORRIDOR_MIN_M: f32 = 1.0;
+
+/// How far a standing body keeps from a wall behind it and from whatever
+/// stands on the floor, in metres.
+const WALL_CLEARANCE_M: f32 = 0.5;
+const BODY_M: f32 = 0.4;
+
+/// What a body steps over rather than walks round, in metres: a cable ramp, a
+/// rug, a floor plate.
+const STEP_M: f32 = 0.3;
+
+/// Clearance over a standing eye, in metres. Anything hung lower is in the way.
+const HEADROOM_M: f32 = 0.2;
+
+/// Widest vertical lens a standing view opens to when it cannot back off far
+/// enough to see the rig, in degrees.
+pub const STANDING_MAX_FOV_DEG: f32 = 75.0;
 
 /// Near plane for every derived camera. The stage is 0.1 m – 50 m and the
 /// projection is reverse-Z, so this is a constant rather than a dial.
@@ -584,6 +794,95 @@ mod tests {
                 "{view:?}: the audience is too close"
             );
         }
+    }
+
+    fn inside(room: [f32; 3], eye: Vec3) -> bool {
+        eye.x.abs() < room[0] / 2.0 && eye.y.abs() < room[1] / 2.0 && eye.z < room[2]
+    }
+
+    #[test]
+    fn a_room_big_enough_to_stand_back_in_changes_nothing() {
+        let view = Viewfinder::new(50.0, 16.0 / 9.0);
+        let open = Camera::for_view(View::Audience, &rig(), None, &view);
+        let hall = rig().in_room(Some([200.0, 200.0, 12.0]));
+        assert_eq!(Camera::for_view(View::Audience, &hall, None, &view), open);
+    }
+
+    #[test]
+    fn standing_views_stay_inside_the_room() {
+        let room = [14.0, 24.0, 7.0];
+        let framing = rig().in_room(Some(room));
+        let booth = Vec3::new(0.0, 9.0, 0.0);
+        for view in finders() {
+            let open = Camera::for_view(View::Audience, &rig(), None, &view);
+            assert!(
+                !inside(room, open.position()),
+                "the room has to be too small for this test to mean anything"
+            );
+            for name in [View::Audience, View::Dj] {
+                let camera = Camera::for_view(name, &framing, Some(booth), &view);
+                assert!(
+                    inside(room, camera.position()),
+                    "{name} eye at {:?}",
+                    camera.position()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_audience_that_cannot_back_off_sees_the_rig_through_a_wider_lens() {
+        let view = Viewfinder::new(50.0, 16.0 / 9.0);
+        let open = Camera::for_view(View::Audience, &rig(), None, &view);
+        let framing = rig().in_room(Some([14.0, 30.0, 7.0]));
+        let camera = Camera::for_view(View::Audience, &framing, None, &view);
+        assert!(camera.fov_y_deg > open.fov_y_deg);
+        assert!(camera.fov_y_deg < STANDING_MAX_FOV_DEG);
+        let wide = Viewfinder {
+            fov_y_deg: camera.fov_y_deg,
+            ..view
+        };
+        assert!(framing.fits(camera.position(), framing.target(), &wide));
+    }
+
+    /// Lights on floor stands all the way round a dance floor, with the booth
+    /// at the upstage side of the circle.
+    fn ring(radius: f32) -> (Framing, Vec3) {
+        let stands = (0..20).map(|i| {
+            let angle = i as f32 / 20.0 * std::f32::consts::TAU;
+            let foot = Vec3::new(radius * angle.cos(), radius * angle.sin(), 0.0);
+            Aabb::new(
+                foot - Vec3::new(0.2, 0.2, 0.0),
+                foot + Vec3::new(0.2, 0.2, 2.0),
+            )
+        });
+        let booth = Vec3::new(0.0, 1.5 - radius, 0.0);
+        let desk = Aabb::new(
+            booth - Vec3::new(1.0, 0.4, 0.0),
+            booth + Vec3::new(1.0, 0.4, 1.0),
+        );
+        (Framing::of([], stands.chain([desk])), booth)
+    }
+
+    #[test]
+    fn the_audience_stands_inside_a_rig_that_surrounds_it() {
+        let (framing, booth) = ring(10.0);
+        for view in finders() {
+            let eye = Camera::for_view(View::Audience, &framing, Some(booth), &view).position();
+            assert!(eye.truncate().length() < 10.0, "eye at {eye:?}");
+            assert!(eye.y > booth.y, "the audience is behind the booth: {eye:?}");
+        }
+    }
+
+    #[test]
+    fn a_truss_over_the_floor_does_not_fence_the_audience_in() {
+        let view = Viewfinder::new(50.0, 16.0 / 9.0);
+        let stage = Aabb::new(Vec3::new(-4.0, -6.0, 0.0), Vec3::new(4.0, -2.0, 1.0));
+        let truss = Aabb::new(Vec3::new(-6.0, 2.0, 5.0), Vec3::new(6.0, 2.3, 5.3));
+        let framing = Framing::of([], [stage, truss]);
+        let camera = Camera::for_view(View::Audience, &framing, None, &view);
+        assert!(camera.position().y > truss.max.y);
+        assert!(framing.fits(camera.position(), framing.target(), &view));
     }
 
     #[test]

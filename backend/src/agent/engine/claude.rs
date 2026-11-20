@@ -42,16 +42,8 @@ const HELD_RESULT_SETTLE: Duration = Duration::from_secs(5);
 
 impl Session {
     pub async fn start(request: Request) -> Result<Self, AgentError> {
-        let mut auth = claude_command(&request.cwd)?;
-        auth.args(["auth", "status", "--json"]).kill_on_drop(true);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(15), auth.output())
-            .await
-            .map_err(|_| protocol("Claude authentication check timed out"))?
-            .map_err(|e| protocol(format!("could not check Claude authentication: {e}")))?;
-        let status: Value = serde_json::from_slice(&status.stdout)
-            .map_err(|e| protocol(format!("invalid Claude authentication status: {e}")))?;
-        if status["loggedIn"] != true || status["authMethod"] != "claude.ai" {
-            return Err(protocol("A new Claude CLI process reports no Claude.ai login. An already-open terminal session may still be signed in. Run `claude auth login` in a fresh terminal, then retry."));
+        if !subscribed(&auth_status(&request.cwd).await?) {
+            return Err(protocol(super::auth::SIGNED_OUT_CLAUDE));
         }
         let mut cmd = stream_command(&request.cwd)?;
         cmd.arg("--system-prompt").arg(&request.system);
@@ -405,8 +397,6 @@ fn stream_command(cwd: &std::path::Path) -> Result<tokio::process::Command, Agen
         "stdio",
         "--setting-sources",
         "",
-        "--max-turns",
-        "64",
     ]);
     Ok(cmd)
 }
@@ -472,8 +462,13 @@ const ALIASES: &[&str] = &["default", "opus", "sonnet", "haiku", "fable"];
 pub(super) async fn models(
     cwd: &std::path::Path,
 ) -> Result<Vec<super::catalog::ModelChoice>, AgentError> {
-    // A CLI that cannot start or is logged out still gets the curated list.
-    let live = match discover(cwd).await {
+    // A CLI that cannot start, is logged out or is slow to answer still gets
+    // the curated list: the bound here is inside the picker's own, so a slow
+    // start costs the CLI's extra rows and never the list.
+    let live = tokio::time::timeout(Duration::from_secs(8), discover(cwd))
+        .await
+        .unwrap_or_else(|_| Err(protocol("the CLI did not answer in time")));
+    let live = match live {
         Ok(live) => live,
         Err(error) => {
             log::warn!("[agent] Claude model discovery failed, using the built-in list: {error}");
@@ -630,7 +625,133 @@ fn claude_command(cwd: &std::path::Path) -> Result<tokio::process::Command, Agen
     Ok(cmd)
 }
 
+/// The CLI's own sign-in for a Claude subscription. It opens the browser and
+/// exits once the login is saved.
+pub(super) fn sign_in_command(
+    cwd: &std::path::Path,
+) -> Result<tokio::process::Command, AgentError> {
+    let mut cmd = claude_command(cwd)?;
+    cmd.args(["auth", "login", "--claudeai"]);
+    Ok(cmd)
+}
+
+pub(super) async fn version(cwd: &std::path::Path) -> Option<String> {
+    super::providers::version_output(claude_command(cwd).ok()?).await
+}
+
+/// What `claude auth status` says of the CLI's login.
+async fn auth_status(cwd: &std::path::Path) -> Result<Value, AgentError> {
+    let mut auth = claude_command(cwd)?;
+    auth.args(["auth", "status", "--json"]).kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(15), auth.output())
+        .await
+        .map_err(|_| protocol("Claude authentication check timed out"))?
+        .map_err(|e| protocol(format!("could not check Claude authentication: {e}")))?;
+    serde_json::from_slice(&status.stdout)
+        .map_err(|e| protocol(format!("invalid Claude authentication status: {e}")))
+}
+
+/// Whether `status` is a Claude subscription login, the one Luma runs on.
+fn subscribed(status: &Value) -> bool {
+    status["loggedIn"] == true && status["authMethod"] == "claude.ai"
+}
+
+/// The Claude subscription the CLI is signed in to, if it is.
+pub(super) async fn account(
+    cwd: &std::path::Path,
+) -> Result<Option<super::providers::Account>, AgentError> {
+    let status = auth_status(cwd).await?;
+    Ok(subscribed(&status).then(|| super::providers::Account {
+        name: status["email"].as_str().map(str::to_string),
+        plan: status["planTier"]
+            .as_str()
+            .or(status["subscriptionType"].as_str())
+            .map(super::providers::plan_name),
+    }))
+}
+
+/// Anthropic's answer about the signed-in subscription's usage, asked with
+/// the access token the CLI saved. See [`super::plan_usage`] for why the
+/// token is only read.
+pub(super) async fn plan_usage() -> Result<Value, AgentError> {
+    let token = access_token().await?;
+    let response = reqwest::Client::new()
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .timeout(Duration::from_secs(8))
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .map_err(|error| protocol(format!("Claude usage: {}", error.without_url())))?;
+    let status = response.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(protocol(
+            "Claude Code's login has expired. It renews the next time Claude runs.",
+        ));
+    }
+    if !status.is_success() {
+        return Err(protocol(format!("Claude usage: HTTP {status}")));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| protocol(format!("Claude usage: {}", error.without_url())))
+}
+
+/// The CLI's saved login: the macOS Keychain item it writes, else the
+/// credentials file it writes where there is no Keychain.
+async fn access_token() -> Result<String, AgentError> {
+    let saved = match keychain_login().await {
+        Some(saved) => Some(saved),
+        None => tokio::fs::read(super::claude_session::config_dir().join(".credentials.json"))
+            .await
+            .ok(),
+    };
+    saved
+        .and_then(|saved| serde_json::from_slice::<Value>(&saved).ok())
+        .and_then(|saved| {
+            saved["claudeAiOauth"]["accessToken"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .ok_or_else(|| protocol(super::auth::SIGNED_OUT_CLAUDE))
+}
+
+/// The Keychain item's name: the CLI's own, with the first eight hex digits
+/// of the config directory's SHA-256 when `CLAUDE_CONFIG_DIR` moves it.
+fn keychain_service() -> String {
+    use sha2::{Digest, Sha256};
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => {
+            let digest = format!("{:x}", Sha256::digest(dir.as_encoded_bytes()));
+            format!("Claude Code-credentials-{}", &digest[..8])
+        }
+        None => "Claude Code-credentials".into(),
+    }
+}
+
+async fn keychain_login() -> Option<Vec<u8>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = tokio::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-a"])
+        .arg(std::env::var_os("USER")?)
+        .arg("-s")
+        .arg(keychain_service())
+        .arg("-w")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
 fn claude_error(frame: &Value) -> AgentError {
+    // A login that expired or was revoked since the check at the start.
+    if frame["error"] == "authentication_failed" || frame["api_error_status"] == 401 {
+        return protocol(super::auth::SIGNED_OUT_CLAUDE);
+    }
     let messages: Vec<_> = frame["errors"]
         .as_array()
         .or_else(|| frame.pointer("/message/content").and_then(Value::as_array))
@@ -697,6 +818,22 @@ mod tests {
         assert!(claude_error(&json!({"error":"invalid_request"}))
             .to_string()
             .contains("invalid_request"));
+    }
+
+    /// A login the API refuses mid-run is a sign-in, however the CLI words
+    /// it; any other refusal is not.
+    #[test]
+    fn a_refused_login_is_a_sign_in() {
+        use super::super::auth::signed_out;
+        for frame in [
+            json!({"error":"authentication_failed","api_error_status":401,
+                "message":{"content":[{"type":"text","text":"Please run /login"}]}}),
+            json!({"is_error":true,"api_error_status":401,"result":"API Error"}),
+        ] {
+            assert!(signed_out(&claude_error(&frame).to_string()), "{frame}");
+        }
+        let overloaded = json!({"is_error":true,"api_error_status":529,"result":"Overloaded"});
+        assert!(!signed_out(&claude_error(&overloaded).to_string()));
     }
 
     /// The CLI's list as 2.1.321 reports it: `default` and the aliases name

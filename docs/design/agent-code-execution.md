@@ -927,6 +927,49 @@ The model does not choose the loading strategy.
 
 ---
 
+### 10.5 Reference scores
+
+```text
+luma.scores
+  find(text, track=, venue=, uses=, limit=)   the user's other scores
+  open(score)                                 one of them, as a read-only reference
+```
+
+`luma.scores` is not in the manifest. It is a capability of the track host
+(`agent_execution/track_host/scores.rs`), present in every track thread, so
+the library costs nothing until a cell asks for it and the binding revision
+does not change with it.
+
+A thread writes one score: the one its scope pins. Any other score is a
+reference, for porting a show to another rig or working in the style of
+another show. The rules:
+
+- **Only the user's own scores.** A score someone else wrote is neither
+  listed nor opened, even in a venue the user may open.
+- **Python names a score id and nothing else.** The host takes a read guard
+  for that score and reads its track and venue off the score's row.
+- **A reference is read through the ordinary hosts.** `track.scores_read`
+  builds a `TrackHost` and a `VenueHost` for the reference's scope with no
+  edit scope, no draft and no actor, and forwards one method to them. So a
+  reference renders and describes its room with the code the current score
+  uses.
+- **Only reads are forwarded.** `READS` in `track_host/scores.rs` lists them.
+  A verb added to a track or venue host is refused for references until it is
+  listed.
+- **There is no copy verb.** A port reads the reference and writes new clips
+  through `luma.track.edit()`. Rigs differ, so what carries over is timing and
+  intent, and the agent decides how this room's lights carry it. The
+  `port-score` skill holds the procedure.
+
+In Python a reference is a `GraphTrack` (`luma_exec/scores.py`), so it reads
+like `luma.track`, on its own track's bar grid, plus `looks()` and `roles()`,
+which digest the show, and `venue`: a `Venue` bound to the reference's room.
+
+`window.filmstrip(frames=8, at=None)` renders the stage at evenly spaced
+moments of a range and returns one figure. It works on `luma.track`, an edit
+and a reference, and a range gives the same moments on every rig, so two rigs
+compare side by side.
+
 ## 11. Graph-run integration
 
 Retired with the pattern-graph agent. A clip's lighting reaches Python as a

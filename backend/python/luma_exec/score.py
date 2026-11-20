@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from .clip import ClipError, Graph, _preset_name, preset
 from .color import from_srgb
 from .host_errors import LumaHostCallError
-from .track import (TrackOutput, TrackError, TrackReadOnlyError,
+from .track import (CheckResult, TrackOutput, TrackError, TrackReadOnlyError,
                     TrackClosedError, TrackHostUnavailableError,
                     _ImmutableSnapshot, _field, _items,
                     _freeze, _range_pair, _selection, _blend, _z,
@@ -43,6 +43,9 @@ from .track import (TrackOutput, TrackError, TrackReadOnlyError,
 # How far, in beats, one clip may run past the start of the next on its track
 # and still count as ending where it starts.
 _TOUCH = 1e-6
+
+# The most frames one filmstrip holds: each is a full render of the stage.
+_STRIP_FRAMES = 16
 
 
 def _plain(value):
@@ -320,6 +323,11 @@ class GraphTrack(_ImmutableSnapshot):
         """
         return Review(self, self._document)
 
+    @property
+    def label(self):
+        """What a figure of this score is titled with."""
+        return self.title
+
     def __repr__(self):
         return f"<luma.track {self.title!r} clips={len(self.clips)} editable={self.editable}>"
 
@@ -574,7 +582,16 @@ class Edit:
         Reports every clip the checker refuses. The verb is check(), not validate().
         """
         self._open()
-        return _check_result(self._track._call("track.score_check", {"candidate": self.candidate}))
+        result = _check_result(self._track._call("track.score_check", {"candidate": self.candidate}))
+        if not result.ok or not _has_aim(self._candidate):
+            return result
+        try:
+            start, end = _show_range(self._track, self._candidate)
+            aim = _aim_warnings(self._track, *_rendered(self._track, self._candidate, start, end))
+        except TrackError:
+            # A host that renders no aim channel has nothing to measure.
+            return result
+        return CheckResult(result.ok, result.errors, result.warnings + aim)
 
     def apply(self):
         """Validate and commit the candidate, then close this edit.
@@ -723,6 +740,109 @@ _ALL_LIT, _BIG_RIG = 0.30, 100
 _OFF_MUSIC = 0.2
 
 
+def _has_aim(document):
+    return any(node.get("kind") == "aim"
+               for clip in (document.get("clips") or {}).values()
+               for node in ((clip.get("graph") or {}).get("nodes") or {}).values())
+
+
+def _show_range(track, document):
+    """The beats a whole-score measurement covers: the track, or the clips when it has no length."""
+    clips = (document.get("clips") or {}).values()
+    start = track._beat_at(0.0)
+    end = max([start] + [clip["start"] + clip["duration"] for clip in clips])
+    if track.duration_s > 0:
+        end = track._beat_at(track.duration_s) - _TOUCH
+    if end <= start:
+        raise TrackError("there is nothing to review: the track has no length and the score no clips")
+    return start, end
+
+
+def _rendered(track, document, start, end):
+    """The score's render over [start, end) beats: light [light, time], aim
+    [light, time, 3] or None, aim weight [light, time] or None, and times in
+    seconds. Sixteen samples to a beat."""
+    import numpy as np
+    light, aim, weight, times = [], [], [], []
+    while start < end - _TOUCH:
+        stop = min(end, start + _REVIEW_CHUNK_BEATS)
+        output = Window(track, document, (start, stop)).output
+        light.append(np.asarray(output.values, dtype=float).max(axis=2))
+        times.extend(float(time) for time in output.times_s)
+        if aim is not None:
+            try:
+                turned = output.aim
+                aim.append(np.asarray(turned.values, dtype=float))
+                weight.append(np.asarray(turned.weight, dtype=float))
+            except TrackError:
+                aim = weight = None
+        start = stop
+    return (np.concatenate(light, axis=1),
+            None if aim is None else np.concatenate(aim, axis=1),
+            None if weight is None else np.concatenate(weight, axis=1),
+            times)
+
+
+def _aim_snaps(light, aim, weight):
+    """Where lit beams change aim in a single step.
+
+    One (sample index, lights, degrees) per moment: the sample the beams
+    arrive at, how many of them turned, and the furthest any turned. A beam
+    counts when it is lit and aimed on both sides of the step, so a move made
+    in the dark is not one, and neither is a beam picking up its first aim.
+    """
+    import numpy as np
+    if aim is None or aim.shape[1] < 2:
+        return []
+    cos = np.clip((aim[:, 1:] * aim[:, :-1]).sum(axis=2), -1.0, 1.0)
+    turn = np.degrees(np.arccos(cos))
+    seen = (light[:, 1:] > _LIT) & (light[:, :-1] > _LIT) & (weight[:, 1:] > _AIMED) & (weight[:, :-1] > _AIMED)
+    snapped = seen & (turn > _SNAP_DEG)
+    return [(int(index) + 1, int(snapped[:, index].sum()), float(turn[snapped[:, index], index].max()))
+            for index in np.flatnonzero(snapped.any(axis=0))]
+
+
+def _unaimed(light, weight):
+    """Per sample, how many lights that the show aims somewhere are lit with no aim on them."""
+    import numpy as np
+    if weight is None:
+        return np.zeros(light.shape[1], dtype=int)
+    movers = (weight > _AIMED).any(axis=1)
+    return ((light > _LIT) & (weight <= _AIMED) & movers[:, None]).sum(axis=0)
+
+
+def _aim_warnings(track, light, aim, weight, times):
+    """What a room would see go wrong with the beams, as warnings."""
+    import numpy as np
+    found = []
+    snaps = _aim_snaps(light, aim, weight)
+    if snaps:
+        at = lambda index: track.bars.format(track._beat_at(times[index]))
+        shown = ", ".join(f"{at(index)} ({lights} lights, {degrees:.0f}°)"
+                          for index, lights, degrees in snaps[:_SHOWN])
+        more = f", and {len(snaps) - _SHOWN} more" if len(snaps) > _SHOWN else ""
+        found.append(f"lit beams snap to a new aim at {shown}{more}; a beam that changes shape in one "
+                     "step whips across the room in view: fade the aim in, let the move take as long "
+                     "as its sound, or make it in the dark")
+    loose = _unaimed(light, weight)
+    if loose.any():
+        bars = np.array([max(1, track.bars.bar_at(track._beat_at(time))) for time in times])
+        firsts = sorted({int((bar - 1) // _REVIEW_BARS * _REVIEW_BARS + 1) for bar in bars[loose > 0]})
+        found.append(f"up to {int(loose.max())} movers are lit with no aim in bars "
+                     f"{_spans(firsts, int(bars.max()))}; they point wherever they rest, and one "
+                     "standing on the floor rests pointing straight up")
+    return tuple(found)
+
+
+# An aim that turns further than this between two samples, a sixteenth of a
+# beat apart, did not travel there: it snapped.
+_SNAP_DEG = 15.0
+# An aim weight above this is a light something aimed.
+_AIMED = 0.01
+# At most this many moments are named in one warning.
+_SHOWN = 6
+
+
 def _spans(firsts, last):
     """Eight-bar sections by first bar as "1-8, 25-40", up to the last bar."""
     spans = []
@@ -755,20 +875,7 @@ class Review:
     def __init__(self, track, document):
         import numpy as np
         clips = (document.get("clips") or {}).values()
-        start = track._beat_at(0.0)
-        end = max([start] + [clip["start"] + clip["duration"] for clip in clips])
-        if track.duration_s > 0:
-            end = track._beat_at(track.duration_s) - _TOUCH
-        if end <= start:
-            raise TrackError("there is nothing to review: the track has no length and the score no clips")
-        light, times = [], []
-        while start < end - _TOUCH:
-            stop = min(end, start + _REVIEW_CHUNK_BEATS)
-            output = Window(track, document, (start, stop)).output
-            light.append(np.asarray(output.values, dtype=float).max(axis=2))
-            times.extend(float(time) for time in output.times_s)
-            start = stop
-        light = np.concatenate(light, axis=1)
+        light, aim, weight, times = _rendered(track, document, *_show_range(track, document))
         grid = track.bars
         bars = np.array([max(1, grid.bar_at(track._beat_at(time))) for time in times])
         level, lit = light.mean(axis=0), light > _LIT
@@ -784,7 +891,7 @@ class Review:
              float(share[section == index].mean()))
             for index in np.unique(section))
         self.follows_music = self._follows(track, bars, level)
-        self.warnings = self._warnings()
+        self.warnings = self._warnings() + _aim_warnings(track, light, aim, weight, times)
 
     def _follows(self, track, bars, level):
         import numpy as np
@@ -1000,6 +1107,8 @@ class Window(_ImmutableSnapshot):
 
     at is the range as two positions; bars is the same range in bars from 1,
     such as (17, 21). start_s and end_s are the range in seconds.
+    timeline() plots the clips, output.heatmap() the light per fixture and
+    filmstrip() the stage itself at several moments.
     """
 
     def __init__(self, track, document, span):
@@ -1015,6 +1124,7 @@ class Window(_ImmutableSnapshot):
             end = track._beat_at(self.end_s)
             print(f"window: clamped to the end of the track: {self.end_s:.3f} s")
         grid = track.bars
+        self._span = (start, end)
         self.at = (grid.format(start), grid.format(end))
         self.bars = (grid.bar_number(start), grid.bar_number(end))
         self.clips = tuple(Clip.read(id, clip, grid) for id, clip in document["clips"].items()
@@ -1025,6 +1135,55 @@ class Window(_ImmutableSnapshot):
     def _render(self):
         return self._track._call("track.score_render", {"candidate": copy.deepcopy(self._document),
                                                        "startTime": self.start_s, "endTime": self.end_s})
+
+    def filmstrip(self, frames=8, *, at=None, view="front", width=480, height=270):
+        """The stage at several moments of this range, as one picture.
+
+        frames moments, evenly spaced from the start of the range, so 8
+        frames over 8 bars is the first beat of each bar. at=["17", "19.3"]
+        picks the moments instead. Each frame is the venue's real renderer
+        with this window's score playing, labelled with its position. The
+        same range gives the same moments on any rig, so a reference's strip
+        and an edit's strip read side by side. view is one of the venue's
+        views. At most 16 frames.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.image import imread
+
+        track = self._track
+        if at is None:
+            if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= _STRIP_FRAMES:
+                raise TrackError(f"frames is a whole number from 1 to {_STRIP_FRAMES}")
+            start, end = self._span
+            beats = [start + index * (end - start) / frames for index in range(frames)]
+        else:
+            if isinstance(at, (str, bytes)) or not 1 <= len(at) <= _STRIP_FRAMES:
+                raise TrackError(f'at is a list of 1 to {_STRIP_FRAMES} positions, such as ["17", "19.3"]')
+            beats = [track.bars.parse(position) for position in at]
+        store = track._artifact_store
+        if store is None:
+            raise TrackHostUnavailableError("a filmstrip needs Luma's host to render the stage")
+        shots = []
+        for beat in beats:
+            response = track._call("venue.render", {
+                "view": str(view), "t": track._seconds_at(beat), "width": int(width), "height": int(height),
+                "edit": copy.deepcopy(self._document)})
+            path = store.workspace / str(response["artifactRel"])
+            shots.append((track.bars.format(beat), imread(path)))
+            # The strip is the figure; its frames are not figures of their own.
+            path.unlink(missing_ok=True)
+        columns = min(len(shots), 4)
+        rows = math.ceil(len(shots) / columns)
+        fig, axes = plt.subplots(rows, columns, squeeze=False, dpi=160,
+                                 figsize=(3 * columns, (3 * height / width + 0.3) * rows + 0.4))
+        for ax in axes.flat:
+            ax.set_axis_off()
+        for ax, (position, image) in zip(axes.flat, shots):
+            ax.imshow(image)
+            ax.set_title(position, fontsize=9)
+        fig.suptitle(f"{track.label} · {'-'.join(self.at)}", fontsize=10)
+        fig.tight_layout()
+        return fig
 
     def timeline(self):
         import matplotlib.pyplot as plt

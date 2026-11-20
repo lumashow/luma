@@ -58,6 +58,13 @@ pub struct Framing {
     /// where to aim, how big the rig is, where its floor is. The fit itself
     /// never touches it; see the module note.
     bounds: Aabb,
+    /// The boxes of the hardware itself — every head and every piece, without
+    /// the light. What a person cannot stand inside or walk through; read by
+    /// the standing views only.
+    solids: Vec<Aabb>,
+    /// The room's `[width, depth, height]` when it has walls, centred on the
+    /// origin. See [`Self::in_room`].
+    room: Option<[f32; 3]>,
 }
 
 impl Framing {
@@ -128,21 +135,56 @@ impl Framing {
         pieces: impl IntoIterator<Item = Aabb>,
     ) -> Self {
         let mut points = Vec::new();
+        let mut solids = Vec::new();
         for beam in beams {
             let head = Vec3::splat(Self::HEAD_RADIUS);
-            points.extend(Aabb::new(beam.origin - head, beam.origin + head).corners());
+            let body = Aabb::new(beam.origin - head, beam.origin + head);
+            points.extend(body.corners());
             points.push(beam.reach());
+            solids.push(body);
         }
         for piece in pieces {
             if !piece.is_empty() {
                 points.extend(piece.corners());
+                solids.push(piece);
             }
         }
         if points.is_empty() {
             points.extend(Aabb::new(Vec3::splat(-1.0), Vec3::splat(1.0)).corners());
         }
         let bounds = Aabb::from_points(points.iter().copied());
-        Self { points, bounds }
+        Self {
+            points,
+            bounds,
+            solids,
+            room: None,
+        }
+    }
+
+    /// The same rig inside a room `[width, depth, height]` metres in size,
+    /// its floor centred on the origin, or under open sky for `None`.
+    ///
+    /// The walls are not framed — a fitted eye may look in from outside them —
+    /// but a body cannot stand behind one, so the standing views
+    /// ([`View::Audience`], [`View::Dj`]) stay inside.
+    ///
+    /// [`View::Audience`]: crate::camera::View::Audience
+    /// [`View::Dj`]: crate::camera::View::Dj
+    #[must_use]
+    pub fn in_room(mut self, room: Option<[f32; 3]>) -> Self {
+        self.room = room;
+        self
+    }
+
+    /// The room this rig is in, when it has walls. See [`Self::in_room`].
+    #[must_use]
+    pub fn room(&self) -> Option<[f32; 3]> {
+        self.room
+    }
+
+    /// The box of every head and every piece: the hardware without its light.
+    pub fn solids(&self) -> impl Iterator<Item = Aabb> + '_ {
+        self.solids.iter().copied()
     }
 
     /// Every point a view has to keep on screen.

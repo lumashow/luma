@@ -38,6 +38,12 @@ states. Concrete shapes:
   fixtures: cells that sit at nearly the same place along the path light as
   one block.
 
+- **In the round** (a ring truss, the DJ in the middle, crowd on every
+  side): there is no downstage. Anything that travels front to back is
+  lighting a stage that is not there, and half the room watches it leave.
+  Light it like a kaleidoscope: the same thing on every side at once,
+  rotating, pulsing out from the centre and back.
+
 Use `u`/`v` (rig-intrinsic axes) rather than world x/y/z when authoring —
 patterns written on `u` survive any venue's rotation and layout.
 
@@ -45,14 +51,17 @@ patterns written on `u` survive any venue's rotation and layout.
 
 Like an orchestra, not interchangeable:
 
-- **Wash/pars** — atmosphere and color. The strings: foundation, always doing
-  something quiet.
+- **Wash/pars** — atmosphere and color. The strings: the foundation when a
+  section needs one. Many do not; a wash left on under everything lifts the
+  floor and flattens every hit above it (see contrast-and-darkness).
 - **LED bars/pixels** — motion and texture. The rhythm section: chases,
   shimmer, gradients.
-- **Strobes** — punctuation only. The cymbal crash: if it plays constantly,
-  it's noise (see contrast-and-darkness on rarity budgets).
-- **Movers/beams** — the soloists, when the venue has them: aerial moments,
-  sweeps, the drop's exclamation. Don't make soloists play rhythm all night.
+- **Strobes** — the hardest thing the rig can do to a body. They belong to
+  the sounds that do the same: a sub that shakes the floor, a growl, a noise
+  sweep at its top. How often is the music's call, not a quota. A relentless
+  drop can live in them; a gentle track never earns one.
+- **Movers/beams** — the soloists, when the venue has them: the only lights
+  that reach across the room. Load `movers` before the first clip on them.
 - **Blinders/audience-facing warm** — connection: the singalong chorus, the
   hands-up moment. Sparingly; the crowd blinded is the crowd removed.
 

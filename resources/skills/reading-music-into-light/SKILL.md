@@ -70,10 +70,32 @@ or chorus to build around. Read it as a singer only when the song is built
 on the voice: long phrases that carry the melody and sections that follow
 the lyric.
 
-**What is the one thing a listener would point at?**
-Every passage has a sound that makes it this song: a vocal chop, a bass
-shape, a snare fill, a strange texture. Find it, give it the clearest
-answer in the section, and make everything else support that.
+**Who is the star?**
+Every passage has a sound that makes it this song: a bass shape, a lead, an
+arp, a snare fill, a strange texture. Name it, out loud, for each section
+before you light it, and say why it is that one. Then give it the best
+lights and the clearest answer, and make everything else support it.
+
+The star is rarely the loudest or the most obvious thing. When a track has
+a bassline that moves (wubs, a reese, a growl, a garage or drum and bass
+riff), that bassline is the star until something proves otherwise, almost
+never the vocal on top. Trace it note by note: where each wub starts, how
+fast it wobbles, when the rate changes. Then give it light that moves the
+way it does: a strobe at the wub's own rate, a chase that bounces back and
+forth as fast as the bass does, a tight circle, a hard on and off for a
+gated note. In a house track
+it is often the arp or the chord stab, not the kick, which every house
+track has. Light the wrong sound and the room is told that the least
+interesting thing in the song is what matters. When a lead plays a line, the
+light plays the line: note for note if it is slow enough, its shape if not.
+
+**Where does the sound end?**
+A light outliving its sound looks like a mistake, and so does a light cut
+off while its sound is still ringing. Give each hit the length of its own
+tail: a crash that has faded by the next beat is dark by the next beat. When
+the music cuts, cut. When it fades, fade. When an element drops out for a
+bar, its light is gone for that bar and back with it, and when it does not
+drop out, neither does the light.
 
 ## From the answers to a look
 
@@ -92,9 +114,11 @@ Decide these in order. Each should trace back to something you measured.
 6. **What stays dark.** Which parts of the rig do nothing here, so that
    they mean something when they come on.
 
-Then check the look against the rig (`rig-craft`): a gradient needs enough
-heads to be smooth, a chase needs a dense axis, and a soloist such as a
-mover or a laser needs a reason.
+Then load `rig-craft` and `contrast-and-darkness` before the first clip:
+one says what this rig can pronounce, the other is where the impact comes
+from. Load `movers` as well if anything in the rig pans or tilts. A
+gradient needs enough heads to be smooth, a chase needs a dense axis, and a
+soloist such as a mover or a laser needs a reason.
 
 ## Stating a direction
 

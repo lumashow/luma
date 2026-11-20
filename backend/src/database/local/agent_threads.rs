@@ -1502,6 +1502,31 @@ mod tests {
         );
     }
 
+    /// A thread stores any CLI service's selection and reads the same one
+    /// back: no engine is one the schema refuses.
+    #[tokio::test]
+    async fn a_thread_keeps_each_cli_services_selection() {
+        use crate::agent::engine::catalog::{Selection, Service};
+        let (_dir, pool) = test_pool().await;
+        let thread = create_thread(&pool, track_thread("track"), OWNER)
+            .await
+            .unwrap();
+        for service in Service::ALL
+            .into_iter()
+            .filter(|service| service.provider().is_none())
+        {
+            let selected = Selection {
+                service,
+                model: Some("test-model".into()),
+                effort: Some("high".into()),
+            };
+            let saved = set_thread_selection(&pool, &thread.id, &selected, OWNER)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", service.label()));
+            assert_eq!(Selection::from_thread(&saved).unwrap(), selected);
+        }
+    }
+
     #[tokio::test]
     async fn model_preference_survives_restart_and_seeds_other_views() {
         use crate::agent::engine::catalog::{Selection, Service};

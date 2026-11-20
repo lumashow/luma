@@ -1,11 +1,12 @@
 # Python dependencies for the beat analysis worker.
-# beat_this is not on PyPI; install directly from the upstream repository.
-beat-this @ git+https://github.com/CPJKU/beat_this.git@c8c320e84f1a4e5b291327debe754734ea802afc
-# madmom is also only on GitHub; needed for DBN post-processing.
-madmom @ git+https://github.com/CPJKU/madmom.git
+beat-this==1.1.0
 librosa>=0.10.0
 soundfile>=0.12.0
 numpy>=1.24.0
 matplotlib>=3.8.0
+# The app installs wheels only. demucs 4.0.1 ships none, but it is pure
+# Python, so building it needs no compiler. Drop this line with a demucs
+# that ships a wheel.
+--no-binary demucs
 demucs==4.0.1
 torchcodec>=0.0.4

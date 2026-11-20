@@ -262,3 +262,29 @@ test("the Account section signs out to the sign-in screen", () => {
     s.find({ role: "text", label: "Sign in to Luma" }) ? s : undefined, { timeoutMs: 15000 });
   assert(!settingsPage(gate), "the settings page stayed up behind the sign-in screen");
 });
+
+// The AI section lists each agent CLI with what is known of it on this
+// device: its version when installed, and who is signed in or the way to
+// sign in. Which of those a machine shows depends on the machine; that every
+// CLI service has a row that settles on one of them does not.
+test("the AI section shows each agent CLI and its account", () => {
+  nav.venue("Test Venue");
+  app.action("luma::OpenSettings");
+  nav.step("the AI settings section", "toggle", "AI");
+  const row = (s, name) => s.find((n) => n.role === "text" && n.label.startsWith(`${name} · `));
+  const listed = until("the providers", (s) =>
+    ["Claude Code", "Codex", "Antigravity"].every((name) => row(s, name)) ? s : undefined,
+    { timeoutMs: 30000 });
+  for (const name of ["Claude Code", "Codex", "Antigravity"]) {
+    const facts = row(listed, name).label;
+    const signIn = listed.find({ role: "button", label: `Sign in to ${name}` });
+    if (facts.endsWith("Not installed")) {
+      assert(signIn === undefined, `${name} is not installed and cannot be signed in to`);
+    } else {
+      assert(/ · v\d/.test(facts), `${name} shows its version: ${facts}`);
+      assert(facts.endsWith("Not signed in") === (signIn !== undefined),
+        `${name} offers a sign-in exactly when nobody is signed in: ${facts}`);
+    }
+  }
+  nav.dismiss();
+});

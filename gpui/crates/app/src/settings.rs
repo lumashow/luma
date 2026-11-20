@@ -40,6 +40,7 @@ use luma_ui::text_input::{self, TextInput};
 use luma_ui::Enabled;
 use luma_ui::{glass, ladder, radius};
 
+use luma_lib::agent::engine::{catalog::Service, plan_usage::PlanUsage, providers::Provider};
 use luma_lib::settings::{
     agent_models, key, ApiKeyStatus, AppSettings, AGENT_PROVIDERS, MAX_DIMMER_RANGE,
 };
@@ -130,6 +131,10 @@ pub struct Settings {
     recording: Option<(&'static str, Subscription)>,
     /// The last refused key, on the row that refused it.
     refused: Option<(&'static str, String)>,
+    /// The CLI services as last read. `None` until the first read lands.
+    providers: Option<Vec<Provider>>,
+    /// The service whose own sign-in is running, in the browser.
+    signing_in: Option<Service>,
 }
 
 impl Settings {
@@ -163,6 +168,8 @@ impl Settings {
             _search: events,
             recording: None,
             refused: None,
+            providers: None,
+            signing_in: None,
         }
     }
 }
@@ -260,6 +267,7 @@ impl Luma {
         self.settings = Some(Settings::new(cx));
         cx.notify();
         self.reload_settings(cx);
+        self.reload_providers(cx);
     }
 
     /// The settings page on DMX Output: where output is turned on, from the
@@ -530,6 +538,45 @@ impl Luma {
         }
     }
 
+    /// Read the CLI services again: asked when the page opens and after a
+    /// sign-in, since each answer means starting a CLI.
+    fn reload_providers(&self, cx: &mut Context<Self>) {
+        let pending = self.library.agent().providers();
+        cx.spawn(async move |this, cx| {
+            let providers = pending.await;
+            this.update(cx, |this, cx| {
+                this.with_settings(cx, |state| state.providers = Some(providers));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Run `service`'s own sign-in, then read the services again.
+    fn sign_in_provider(&mut self, service: Service, cx: &mut Context<Self>) {
+        if self
+            .settings
+            .as_ref()
+            .is_none_or(|state| state.signing_in.is_some())
+        {
+            return;
+        }
+        self.with_settings(cx, |state| state.signing_in = Some(service));
+        let pending = self.library.agent().sign_in(service);
+        cx.spawn(async move |this, cx| {
+            let result = pending.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    log::warn!("{} sign-in: {error}", service.label());
+                }
+                this.with_settings(cx, |state| state.signing_in = None);
+                this.reload_providers(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn reload_settings(&self, cx: &mut Context<Self>) {
         let pending = self.library.settings();
         cx.spawn(async move |this, cx| {
@@ -574,6 +621,7 @@ impl Luma {
 
     fn apply_display_settings(&mut self, values: &AppSettings, cx: &mut Context<Self>) {
         luma_chat::set_compact_turns(values.compact_turns, cx);
+        luma_chat::set_escape_stops_turn(values.escape_stops_turn, cx);
         if self.hdr_output_allowed != values.hdr_output {
             self.hdr_output_allowed = values.hdr_output;
             cx.notify();
@@ -970,13 +1018,22 @@ fn general(values: &AppSettings, app: &Entity<Luma>) -> Vec<Section> {
         ),
         section(
             "Chat",
-            vec![checkbox(
-                app,
-                key::COMPACT_TURNS,
-                "Compact turns",
-                values.compact_turns,
-                Some("Fold a finished turn's thinking, tool calls and narration behind one \"Worked for\" header. The final reply stays visible."),
-            )],
+            vec![
+                checkbox(
+                    app,
+                    key::COMPACT_TURNS,
+                    "Compact turns",
+                    values.compact_turns,
+                    Some("Fold a turn's thinking and tool calls behind a header. Everything the agent writes stays visible."),
+                ),
+                checkbox(
+                    app,
+                    key::ESCAPE_STOPS_TURN,
+                    "Escape stops the agent",
+                    values.escape_stops_turn,
+                    Some("Pressing Escape in the message box stops the running turn."),
+                ),
+            ],
             None,
         ),
     ]
@@ -995,12 +1052,30 @@ fn ai(state: &Settings, values: &AppSettings, app: &Entity<Luma>) -> Vec<Section
             values.agent_engine.key(),
         ),
     );
+    let providers = section(
+        "Providers",
+        match &state.providers {
+            Some(providers) => providers
+                .iter()
+                .map(|provider| provider_row(provider, state.signing_in, app))
+                .collect(),
+            None => vec![row(
+                "Checking the installed agents…",
+                None,
+                div().into_any_element(),
+            )],
+        },
+        Some("The agents installed on this device, and the accounts they are signed in with."),
+    );
     if values.agent_engine != Engine::Api {
-        return vec![section(
-            "Defaults",
-            vec![engine],
-            Some("Uses the locally installed agent and its signed-in account. Sign in with the agent's CLI on each machine."),
-        )];
+        return vec![
+            section(
+                "Defaults",
+                vec![engine],
+                Some("Uses the locally installed agent and its signed-in account."),
+            ),
+            providers,
+        ];
     }
     let defaults = section(
         "Defaults",
@@ -1044,12 +1119,128 @@ fn ai(state: &Settings, values: &AppSettings, app: &Entity<Luma>) -> Vec<Section
         .collect();
     vec![
         defaults,
+        providers,
         section(
             "API keys",
             keys,
             Some("Keys are kept on this device only. They are not synced to your account."),
         ),
     ]
+}
+
+/// One CLI service: its name over what is known of it — the CLI's version,
+/// the account and its plan — and at the end the plan's usage, or the button
+/// that signs in when nobody is.
+fn provider_row(provider: &Provider, signing_in: Option<Service>, app: &Entity<Luma>) -> Row {
+    let service = provider.service;
+    let name = service.label();
+    let mut facts = Vec::new();
+    let mut control = div().into_any_element();
+    match (&provider.version, &provider.account) {
+        (None, _) => facts.push("Not installed".to_string()),
+        (Some(version), Some(account)) => {
+            facts.push(format!("v{version}"));
+            facts.extend(account.name.clone());
+            facts.extend(account.plan.clone());
+            // A CLI that names neither still says somebody is signed in.
+            if account.name.is_none() && account.plan.is_none() {
+                facts.push("Signed in".into());
+            }
+            if let Some(usage) = &provider.usage {
+                control = usage_meters(name, usage);
+            }
+        }
+        (Some(version), None) => {
+            facts.push(format!("v{version}"));
+            facts.push("Not signed in".into());
+            let label = if signing_in == Some(service) {
+                "Finish in your browser…"
+            } else {
+                "Sign in"
+            };
+            let act = app.clone();
+            control = luma_ui::button(label, Enabled::from(signing_in.is_none()))
+                .id(SharedString::from(format!("provider-sign-in-{name}")))
+                .on_click(move |_, _, cx| {
+                    act.update(cx, |this, cx| this.sign_in_provider(service, cx));
+                })
+                .agent_node(Role::Button, format!("Sign in to {name}"))
+                .into_any_element();
+        }
+    }
+    let summary = facts.join(" · ");
+    let element = card_row()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(name),
+                )
+                .child(help_text(&summary).agent_node(Role::Text, format!("{name} · {summary}"))),
+        )
+        .child(control_slot(control));
+    Row::new(element, name, Some(&summary))
+}
+
+/// A plan's windows, one line each: its name, a bar filled as far as it is
+/// used, and the percent.
+fn usage_meters(service: &str, usage: &PlanUsage) -> AnyElement {
+    div()
+        .w(px(CONTROL_WIDTH))
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .text_size(px(12.))
+        .text_color(ladder::muted_foreground())
+        .children(usage.windows.iter().map(|window| {
+            // A plan that meters groups of models apart names the group.
+            let label = match &window.group {
+                Some(group) => format!("{group} · {}", window.label),
+                None => window.label.clone(),
+            };
+            let percent = format!("{}%", (window.used * 100.).round());
+            let fill = match window.used {
+                used if used >= 0.95 => ladder::status_bad(),
+                used if used >= 0.8 => ladder::status_warn(),
+                _ => ladder::accent(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(div().flex_none().min_w(px(52.)).child(label.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(glass::ink(0.12))
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded_full()
+                                .bg(fill)
+                                .w(relative(window.used)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(34.))
+                        .flex_none()
+                        .flex()
+                        .justify_end()
+                        .child(percent.clone()),
+                )
+                .agent_node(Role::Text, format!("{service} {label} usage · {percent}"))
+        }))
+        .into_any_element()
 }
 
 /// One service's key: the masked draft field, Save, and Clear while a key is

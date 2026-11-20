@@ -559,7 +559,7 @@ fn install_requirements(python_path: &Path, env_dir: &Path) -> Result<(), String
     }
 
     run_command(
-        command(python_path).args(["-m", "pip", "install", "--upgrade", "pip"]),
+        pip_install(python_path).args(["--upgrade", "pip"]),
         "upgrade pip",
     )?;
 
@@ -573,8 +573,7 @@ fn install_requirements(python_path: &Path, env_dir: &Path) -> Result<(), String
             eprintln!("[python-env] Installing PyTorch ({})…", torch_plan.label);
 
             let result = run_command(
-                command(python_path)
-                    .args(["-m", "pip", "install"])
+                pip_install(python_path)
                     .args(&pkg_args)
                     .args(["--index-url", index_url]),
                 "install PyTorch with CUDA support",
@@ -586,28 +585,19 @@ fn install_requirements(python_path: &Path, env_dir: &Path) -> Result<(), String
                     err
                 );
                 run_command(
-                    command(python_path)
-                        .args(["-m", "pip", "install"])
-                        .args(&pkg_args),
+                    pip_install(python_path).args(&pkg_args),
                     "install PyTorch (CPU fallback)",
                 )?;
             }
         } else {
-            run_command(
-                command(python_path)
-                    .args(["-m", "pip", "install"])
-                    .args(&pkg_args),
-                "install PyTorch",
-            )?;
+            run_command(pip_install(python_path).args(&pkg_args), "install PyTorch")?;
         }
     }
 
     // Step 2: Install everything else from the requirements files.
     for requirements_path in &requirement_paths {
         run_command(
-            command(python_path)
-                .args(["-m", "pip", "install", "-r"])
-                .arg(requirements_path),
+            pip_install(python_path).arg("-r").arg(requirements_path),
             &format!(
                 "install python requirements from {}",
                 requirements_path.display()
@@ -617,6 +607,20 @@ fn install_requirements(python_path: &Path, env_dir: &Path) -> Result<(), String
 
     fs::write(&marker, hash).map_err(|e| format!("Failed to write requirements marker: {}", e))?;
     Ok(())
+}
+
+/// `pip install` from wheels only. The bundled CPython's sysconfig names the
+/// compiler it was built with (clang), which a user's machine may not have, so
+/// a source build there fails. A requirement that ships no wheel opts out with
+/// `--no-binary` beside its pin, and must be pure Python.
+///
+/// Wheels-only covers what pip finds on an index. A direct reference
+/// (`name @ git+https://…`) is built from source whatever this says, so no
+/// requirement may be one: see `every_requirement_names_a_release`.
+fn pip_install(python_path: &Path) -> Command {
+    let mut pip = command(python_path);
+    pip.args(["-m", "pip", "install", "--only-binary", ":all:"]);
+    pip
 }
 
 fn requirements_hash(torch: &TorchInstall) -> String {
@@ -1090,5 +1094,24 @@ mod tests {
             let torn: usize = readers.into_iter().map(|r| r.join().unwrap()).sum();
             assert_eq!(torn, 0, "a reader saw a half-written script");
         });
+    }
+
+    /// pip builds a direct reference (`name @ git+https://…`, a URL, a path)
+    /// from source even under [`pip_install`]'s wheels-only flag. So each line
+    /// is a comment, a `--no-binary` opt-out, or a release on an index.
+    #[test]
+    fn every_requirement_names_a_release() {
+        for (file, contents) in REQUIREMENT_FILES {
+            for line in contents.lines() {
+                let requirement = line.split('#').next().unwrap_or_default().trim();
+                if requirement.is_empty() || requirement.starts_with("--no-binary ") {
+                    continue;
+                }
+                assert!(
+                    !requirement.starts_with('-') && !requirement.contains(['@', '/']),
+                    "{file}: `{requirement}` is not a release from an index"
+                );
+            }
+        }
     }
 }

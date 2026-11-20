@@ -360,6 +360,12 @@ impl Composer {
         self.input.read(cx).text().trim().to_string()
     }
 
+    /// What is typed, as typed: a draft keeps its leading and trailing space.
+    #[must_use]
+    pub fn draft(&self, cx: &gpui::App) -> String {
+        self.input.read(cx).text().to_string()
+    }
+
     /// Restore a prompt the backend never accepted, preserving any new draft.
     pub(crate) fn restore(&self, prompt: &str, cx: &mut gpui::App) {
         self.input.update(cx, |input, cx| {

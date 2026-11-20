@@ -174,3 +174,13 @@ pub const SEND_DIAMETER: f32 = 28.0;
 pub const HERO_WIDTH: f32 = 260.0;
 
 // -- the panel ---------------------------------------------------------------
+
+/// A prompt longer than either of these is clipped to the line count behind
+/// "Show more". Comet's numbers.
+pub const PROMPT_CLIP_LINES: usize = 5;
+pub const PROMPT_CLIP_CHARS: usize = 400;
+/// How long a tool card takes to fold open or shut. Comet's: short enough
+/// that the click and the result read as one thing.
+pub const TOOL_FOLD_MS: f32 = 140.0;
+/// How far a press has to move before it is a drag and not a click.
+pub const DRAG_SLOP_PX: f32 = 4.0;

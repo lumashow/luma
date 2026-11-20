@@ -6,6 +6,7 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from luma_exec.color import from_srgb, to_display
@@ -129,6 +130,34 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(edit.candidate["clips"], {kept.id: dict(stored, start=4)})
         with self.assertRaisesRegex(TrackError, "label 'kept' is on two clips"):
             edit.replace_source(json.dumps({"clips": {kept.id: stored, "other": stored}}))
+
+    def beams(self, yaw_deg, lit):
+        """Two beams over eight samples: light [2, 8], aim [2, 8, 3] and weight [2, 8]."""
+        import numpy as np
+        yaw = np.radians(np.asarray(yaw_deg, dtype=float))
+        aim = np.stack([np.sin(yaw), np.zeros_like(yaw), -np.cos(yaw)], axis=-1)
+        return (np.repeat(np.asarray(lit, dtype=float)[None, :], 2, axis=0),
+                np.repeat(aim[None, :, :], 2, axis=0), np.ones((2, 8)))
+
+    def test_a_lit_beam_that_changes_aim_in_one_step_is_a_snap(self):
+        from luma_exec.score import _aim_snaps
+        jump = [0, 0, 0, 0, 60, 60, 60, 60]
+        lit = _aim_snaps(*self.beams(jump, [1] * 8))
+        self.assertEqual([(index, lights) for index, lights, _ in lit], [(4, 2)])
+        self.assertAlmostEqual(lit[0][2], 60.0, places=3)
+        # The same move with the light off on either side of it is a move in the dark.
+        self.assertEqual(_aim_snaps(*self.beams(jump, [1, 1, 1, 0, 0, 1, 1, 1])), [])
+        # A sweep covers the same angle and never snaps.
+        self.assertEqual(_aim_snaps(*self.beams([0, 8, 16, 24, 32, 40, 48, 56], [1] * 8)), [])
+
+    def test_a_mover_lit_before_anything_aims_it_is_counted(self):
+        from luma_exec.score import _unaimed
+        light, _, weight = self.beams([0] * 8, [1] * 8)
+        weight[:, :3] = 0.0
+        self.assertEqual(list(_unaimed(light, weight)), [2, 2, 2, 0, 0, 0, 0, 0])
+        # A light nothing ever aims is a par, and a par has no rest position to worry about.
+        weight[1, :] = 0.0
+        self.assertEqual(list(_unaimed(light, weight)), [1, 1, 1, 0, 0, 0, 0, 0])
 
     def rendered(self, level):
         """A 48-bar track whose render is `level(seconds)` per light: (lights, rgb level)."""
@@ -413,32 +442,45 @@ class ScoreTests(unittest.TestCase):
             return {"name": name, "graph": graph, "start": start, "duration": 1, "seed": 0,
                     "selection": {"expression": group}, "z_index": 1, "blend_mode": "add"}
         answers = {
-            "track.scores_find": {"scores": [{
-                "id": "other", "name": "Fantastic", "track_id": "track", "track_title": "Test",
-                "track_artist": "Someone", "venue_name": "frat", "clips": 3,
-                "updated_at": "2026-11-10T04:00:00Z"}]},
+            "track.scores_find": {"more": True, "scores": [{
+                "id": "other", "name": "Fantastic", "track_id": "track", "title": "Test",
+                "artist": "Someone", "venue_id": "venue-2", "venue_name": "frat", "clips": 3,
+                "edited_at": "2026-11-10T04:00:00Z"}]},
             "track.scores_open": {
-                "id": "other", "name": "Fantastic", "track_id": "track", "track_title": "Test",
-                "same_track": True,
-                "venue": {"id": "venue-2", "name": "frat", "groups": [
+                "id": "other", "name": "Fantastic", "same_track": True,
+                "track": {"id": "track", "title": "Test", "editable": False, "beat_origin_s": 1.5,
+                          "document": {"clips": {
+                              "a": clip("Snare 1.2", 1, "bars"), "b": clip("Snare @2.2.1", 5, "bars"),
+                              "c": clip("Floor", 0, "bars | gone")}}},
+                "features": {"beats": [1., 1.5, 2., 3., 4.], "downbeats": [1.5, 5.], "beats_per_bar": 4},
+                "venue": {"id": "venue-2", "name": "frat", "views": ["front"], "groups": [
                     {"name": "bars", "fixtures": 4, "cells": 0, "models": ["Tetra"]},
-                    {"name": "movers", "fixtures": 2, "cells": 0, "models": ["Sharpy"]}]},
-                "document": {"clips": {
-                    "a": clip("Snare 1.2", 1, "bars"), "b": clip("Snare @2.2.1", 5, "bars"),
-                    "c": clip("Floor", 0, "bars | gone")}}},
+                    {"name": "movers", "fixtures": 2, "cells": 0, "models": ["Sharpy"]}]}},
+            "track.scores_read": {"groups": []},
         }
         calls = []
         def call(method, payload):
             calls.append((method, payload))
             return answers.get(method, {"ok": True})
         object.__setattr__(track, "_host_call", call)
+        object.__setattr__(track, "_artifact_store", SimpleNamespace(workspace=Path(".")))
         scores = Scores(track)
-        found = scores.find("fantastic", track=track)
-        self.assertEqual(calls[0], ("track.scores_find", {"text": "fantastic", "track_id": "track"}))
+        found = scores.find("fantastic", track=track, venue="frat")
+        self.assertEqual(calls[0], ("track.scores_find", {
+            "text": "fantastic", "track_id": "track", "venue": "frat", "uses": None, "limit": 20}))
         self.assertIn('Test — Someone @ frat · "Fantastic" · 3 clips · edited 2026-11-10', repr(found))
+        self.assertIn("more match", repr(found))
         ref = scores.open(found[0])
         self.assertEqual(calls[1], ("track.scores_open", {"id": "other"}))
         self.assertEqual(len(ref.clips), 3)
+        # A reference is read through the open track, one named read at a time,
+        # and has no way to an edit.
+        ref._call("venue.groups", {})
+        self.assertEqual(calls[2], ("track.scores_read", {
+            "score": "other", "method": "venue.groups", "payload": {}}))
+        with self.assertRaisesRegex(TrackError, "read-only"):
+            ref.edit()
+        self.assertEqual(ref.venue.name, "frat")
         looks = ref.looks()
         # Two clips named for one look and a place are one look, counted twice.
         self.assertIn("Snare: 2x color add, 1 beats, on bars", looks)

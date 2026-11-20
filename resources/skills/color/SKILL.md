@@ -76,6 +76,12 @@ don't — there, color belongs to sections.
   before and after the loop point.
 - Iridescence is neighbors, not opposites: a narrow band of hues spread
   across a surface and drifting, so each light is slightly off the next.
+- Many colors can live in time or in space, and they are different shows.
+  Every light stepping through the same five colors together is one color at
+  a time, five times over: the room is always a single flat hue. The same
+  family of colors laid across the rig at once, each group or each light a
+  neighbor of the next, is a picture. When a song wants many colors, try
+  space first and keep them in one theme.
 
 ## Choosing a palette for a track
 

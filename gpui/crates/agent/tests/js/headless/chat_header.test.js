@@ -101,7 +101,7 @@ test("a sent prompt lands below the header", () => {
   app.type(composer(app.snapshot()), AGAIN);
   app.click(app.snapshot().find({ role: "button", label: "Send" }));
   const landed = until("the second reply", (s) =>
-    !busy(s) && !s.find({ role: "card", label: "Sending message" })
+    !busy(s)
       && s.findAll({ role: "text" }).some((n) => n.label === "The movers are parked.") ? s : undefined);
   app.frames(10);
   const shot = app.snapshot();

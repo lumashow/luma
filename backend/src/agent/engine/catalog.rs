@@ -9,6 +9,7 @@ use std::collections::HashMap;
 pub enum Service {
     Claude,
     Codex,
+    Antigravity,
     OpenRouter,
     /// Also where a selection saved for the removed first-party Anthropic API
     /// (`"anthropic"`) lands.
@@ -17,12 +18,19 @@ pub enum Service {
 }
 
 impl Service {
-    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::OpenRouter, Self::Vercel];
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Antigravity,
+        Self::OpenRouter,
+        Self::Vercel,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
+            Self::Antigravity => "Antigravity",
             Self::OpenRouter => "OpenRouter",
             Self::Vercel => "Vercel AI Gateway",
         }
@@ -32,7 +40,8 @@ impl Service {
         match self {
             Self::Claude => Engine::Claude,
             Self::Codex => Engine::Codex,
-            _ => Engine::Api,
+            Self::Antigravity => Engine::Antigravity,
+            Self::OpenRouter | Self::Vercel => Engine::Api,
         }
     }
 
@@ -54,6 +63,7 @@ impl Service {
         match engine {
             Engine::Claude => Self::Claude,
             Engine::Codex => Self::Codex,
+            Engine::Antigravity => Self::Antigravity,
             Engine::Api => match provider
                 .and_then(Provider::parse)
                 .unwrap_or(Provider::DEFAULT)
@@ -236,6 +246,7 @@ pub async fn models(
         match service {
             Service::Claude => super::claude::models(cwd).await,
             Service::Codex => super::codex::models(cwd).await,
+            Service::Antigravity => super::antigravity::models(cwd).await,
             _ => Ok(table_choices(service.provider().expect("API service"))),
         }
     };
@@ -293,6 +304,36 @@ pub async fn cached_gateway(
     remote::read_cache(cache)
         .await
         .map(|models| api_choices(provider, models))
+}
+
+/// A CLI's list as saved at `cache` by [`save_choices`].
+pub async fn saved_choices(cache: &std::path::Path) -> Option<Vec<ModelChoice>> {
+    let bytes = tokio::fs::read(cache).await.ok()?;
+    serde_json::from_slice::<Vec<ModelChoice>>(&bytes)
+        .ok()
+        .filter(|models| !models.is_empty())
+}
+
+/// Save a CLI's list at `cache`. Written beside and renamed over the old
+/// copy, so a reader never sees half a file.
+///
+/// # Errors
+///
+/// Any I/O error, as text.
+pub async fn save_choices(cache: &std::path::Path, models: &[ModelChoice]) -> Result<(), String> {
+    let json = serde_json::to_vec(models).map_err(|error| error.to_string())?;
+    if let Some(dir) = cache.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let partial = cache.with_extension("json.partial");
+    tokio::fs::write(&partial, json)
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(&partial, cache)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The table's models that `provider` routes.

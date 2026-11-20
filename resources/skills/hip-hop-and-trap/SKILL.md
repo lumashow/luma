@@ -62,8 +62,8 @@ Depth: light to moderate. The vocal leads.
   808 slides, hook returns, and the beat switch.
 - Detail: one pass of the loop per section; 16th resolution only on the
   dozen moments you will light. Hat rolls are low-confidence in n2n; confirm
-  them in the high band before lighting one. No parallel listeners.
+  them in the high band before lighting one.
 - LDs love: a blackout on the silence after a punchline, and a full palette
   change on the beat switch.
 
-Section-level work plus a handful of placed accents, single pass, no fan-out.
+Section-level work plus a handful of placed accents, single pass.
